@@ -1,0 +1,282 @@
+#!/bin/bash
+# The plan pass, plan-pass.sh --mode runner, inside the isolated runner: one host command for
+# a list of examples. See README.md in this directory.
+#
+# Usage:
+#   run-pass.sh --clone DIR --record DIR (--profile NAME | --credentials-env-file FILE)
+#               [--base SHA] [--budget-minutes N] [--tmp DIR] [--build] <example-dir>...
+#
+# --tmp names an existing directory, such as the pull request skill's run directory, to hold
+# this script's private temporary directory, and with it the credentials file for the plan
+# containers. The EXIT trap removes it; after a SIGKILL, whoever removes --tmp removes it
+# too. Without --tmp it is made under TMPDIR.
+#
+# The runner has no cap on the number of examples. Its bound is a wall-clock budget for the
+# whole pass, 120 minutes unless --budget-minutes says otherwise, recorded in plan-pass.txt.
+# Every container gets what is left of it, and each command keeps its own timeout.
+#
+# --clone is a git checkout of the head, as the pull request skill's Workspace makes it, with
+# its origin remote, so the plan pass can fetch --base for a re-run. The record directory must
+# not exist yet; it is created 0700 and ends up holding regular files only.
+#
+# Phases: the init phase runs in one container behind the init proxy (registry and download
+# hosts), with no credentials. The plan phase runs one container per example behind the plan
+# proxy (AWS service endpoints), with the work volume read-only, and is the only place the
+# credentials go. With --base, an example whose plan is a code-error is then re-run at the
+# merge base in two more containers: base-init behind the init proxy, base-plan behind the
+# plan proxy. Examples that planned never touch the base. This script owns the credentials: it exports them on the host and passes
+# them to each plan container, and plan-pass.sh reads them there instead of calling
+# aws configure export-credentials itself.
+set -euo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+pass="$(cd "$here/.." && pwd)/plan-pass.sh"
+# The image tag: PLAN_RUNNER_TAG, or one derived from the files the images are built from
+tag="$("$here/image-tag.sh")"
+runner_image="plan-runner:$tag"
+proxy_image="plan-egress-proxy:$tag"
+clone="" record="" profile="" cred_file="" base="" build=0 budget_min=120 tmp_parent=""
+
+die() { echo "run-pass: $*" >&2; exit 2; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --clone) clone="${2:-}"; shift 2 ;;
+    --record) record="${2:-}"; shift 2 ;;
+    --profile) profile="${2:-}"; shift 2 ;;
+    --credentials-env-file) cred_file="${2:-}"; shift 2 ;;
+    --base) base="${2:-}"; shift 2 ;;
+    --budget-minutes) budget_min="${2:-}"; shift 2 ;;
+    --tmp) tmp_parent="${2:-}"; shift 2 ;;
+    --build) build=1; shift ;;
+    --) shift; break ;;
+    -*) die "unknown argument: $1" ;;
+    *) break ;;
+  esac
+done
+[ "$#" -ge 1 ] || die "name at least one example directory"
+[ -n "$clone" ] && [ -d "$clone/.git" ] || die "--clone must name a git checkout"
+[ -n "$record" ] || die "--record is required"
+[ ! -e "$record" ] && [ ! -L "$record" ] || die "--record must not exist yet: $record"
+[ -n "$profile" ] || [ -n "$cred_file" ] || die "--profile or --credentials-env-file is required"
+[ -z "$profile" ] || [ -z "$cred_file" ] || die "--profile and --credentials-env-file exclude each other"
+# The profile name also goes to the plan pass, which redacts it from kept lines
+pname="${profile:-smoke}"
+[[ "$pname" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid profile name"
+[ -z "$base" ] || [[ "$base" =~ ^[0-9a-f]{40}$ ]] || die "--base must be a full commit SHA"
+[[ "$budget_min" =~ ^[1-9][0-9]{0,3}$ ]] || die "--budget-minutes must be a whole number of minutes, 1 to 9999"
+budget=$((budget_min * 60))
+if [ -n "$tmp_parent" ]; then
+  [ -d "$tmp_parent" ] && [ ! -L "$tmp_parent" ] || die "--tmp must name an existing directory"
+  tmp_parent="$(cd "$tmp_parent" && pwd -P)"
+else
+  tmp_parent="${TMPDIR:-/tmp}"
+fi
+[ -z "$cred_file" ] || [ -f "$cred_file" ] || die "no such credentials file: $cred_file"
+for ex in "$@"; do
+  case "$ex" in /* | *..* | -*) die "refusing example path: $ex" ;; esac
+done
+clone="$(cd "$clone" && pwd)"
+mkdir -m 0700 "$record"
+record="$(cd "$record" && pwd)"
+max_bytes=5242880 # a record file, a log or a container's output stops at 5 MiB
+
+if [ "$build" -eq 1 ]; then
+  docker build -q -f "$here/Dockerfile.proxy" -t "$proxy_image" "$here" > /dev/null
+  docker build -q -f "$here/Dockerfile.runner" -t "$runner_image" "$here" > /dev/null
+fi
+
+TMPRUN="$(mktemp -d "$tmp_parent/plan-runner.XXXXXX")"
+chmod 0700 "$TMPRUN"
+id="$(basename "$TMPRUN" | tr -dc '[:alnum:]' | tr '[:upper:]' '[:lower:]')"
+sfx="$(printf '%s' "$id" | tail -c 6)"
+RUN="/work/pr-review.$sfx" # the plan pass's run directory, inside the work volume
+net_int="plan-int-$id" net_ext="plan-ext-$id" volume="plan-work-$id"
+runner="plan-runner-$id" proxy_init="plan-proxy-init-$id" proxy_plan="plan-proxy-plan-$id"
+# Every name carries this run's id, and cleanup removes exactly these names, never by prefix
+echo "$id" > "$record/run-id.txt"
+
+save_proxy_log() { # container, record file; a proxy may run twice, so the log is appended
+  local have=0
+  [ ! -f "$record/$2" ] || have=$(wc -c < "$record/$2")
+  docker logs "$1" 2>&1 | head -c $((max_bytes - have)) >> "$record/$2" || true
+  docker rm -f "$1" > /dev/null 2>&1 || true
+}
+cleanup() {
+  docker rm -f "$runner" > /dev/null 2>&1 || true
+  for p in "$proxy_init:proxy-init.log" "$proxy_plan:proxy-plan.log"; do
+    if docker container inspect "${p%%:*}" > /dev/null 2>&1; then
+      save_proxy_log "${p%%:*}" "${p##*:}"
+    fi
+  done
+  docker volume rm "$volume" > /dev/null 2>&1 || true
+  docker network rm "$net_int" "$net_ext" > /dev/null 2>&1 || true
+  case "$TMPRUN" in
+    "$tmp_parent"/plan-runner.??????) rm -rf -- "$TMPRUN" ;;
+    *) echo "refusing to delete: $TMPRUN" >&2 ;;
+  esac
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+# Credentials: exported on the host, session credentials only, renamed so that only the plan
+# pass reads them.
+src="$TMPRUN/creds.env"
+if [ -n "$profile" ]; then
+  aws configure export-credentials --profile="$profile" --format env-no-export \
+    --no-cli-pager < /dev/null > "$src"
+else
+  cp "$cred_file" "$src"
+fi
+grep -Eq '^AWS_SESSION_TOKEN=.+' "$src" ||
+  die "the credentials carry no session token, so they are long-lived keys; use a role or SSO profile"
+grep -E '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=' "$src" | sed 's/^/PLAN_PASS_/' > "$TMPRUN/pass.env"
+leak_values="$(sed -nE 's/^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=//p' "$src")"
+rm -f "$src"
+
+docker volume create "$volume" > /dev/null
+docker network create --internal "$net_int" > /dev/null
+docker network create "$net_ext" > /dev/null
+
+hardening=(--read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 512)
+proxy_env=(-e HTTPS_PROXY=http://proxy:8888 -e HTTP_PROXY=http://proxy:8888
+  -e https_proxy=http://proxy:8888 -e http_proxy=http://proxy:8888 -e NO_PROXY= -e no_proxy=)
+common=("${hardening[@]}" --user 10001:10001 --memory 4g --tmpfs "/tmp:rw,size=64m"
+  -v "$pass":/opt/plan-pass/plan-pass.sh:ro)
+
+start_proxy() { # name, config
+  docker run -d --name "$1" --network "$net_ext" "${hardening[@]}" \
+    --tmpfs /tmp:rw,size=16m "$proxy_image" "/etc/tinyproxy/$2" > /dev/null
+  docker network connect --alias proxy "$net_int" "$1"
+}
+in_runner() { # stdout file, then docker run arguments
+  local outf="$1"; shift
+  docker rm -f "$runner" > /dev/null 2>&1 || true
+  docker run --name "$runner" "$@" 2> >(head -c "$max_bytes" >> "$record/runner.log") |
+    head -c "$max_bytes" >> "$outf" || true
+}
+
+# Prepare: copy the read-only clone into the run directory. No network.
+in_runner "$record/runner.log" --network none "${common[@]}" -v "$clone":/src:ro -v "$volume":/work \
+  --entrypoint /bin/bash "$runner_image" -c "mkdir -m 700 '$RUN' && cp -a /src '$RUN/clone'"
+
+# The budget runs from here: init, the plans and the merge base re-runs.
+t0=$SECONDS
+# Read once per container: the value checked is the value passed, so a container never
+# starts with a budget of 0 or less
+left() { echo $((budget - (SECONDS - t0))); }
+
+# Init phase: G0, gates and init for every example. No credentials.
+start_proxy "$proxy_init" init.conf
+in_runner "$record/plan-pass-init.txt" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
+  -v "$volume":/work --entrypoint /bin/bash "$runner_image" -c \
+  "bash /opt/plan-pass/plan-pass.sh g0 '$RUN' && exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$budget' --phase init \"\$@\"" \
+  plan-pass "$@"
+save_proxy_log "$proxy_init" proxy-init.log
+
+SEED="/seed/pr-review.$sfx"
+base_args=()
+[ -z "$base" ] || base_args=(--base "$base")
+plan_container() { # output file, phase, index, example, budget left: the work volume read-only, the credentials in
+  # The volume stays read-only; the example's own plan may write into its directory, as the
+  # lambda module's packaging does, so the clone (and the base worktree) are private
+  # writable copies on tmpfs, seeded from the volume at start and gone with the container.
+  local base_tmpfs=() seed_base=:
+  if [ "$2" = base-plan ]; then
+    base_tmpfs=(--tmpfs "$RUN/base:rw,size=1g,mode=1777")
+    seed_base="{ [ ! -d '$SEED/base' ] || cp -dR '$SEED/base/.' '$RUN/base/'; }"
+  fi
+  in_runner "$1" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
+    -v "$volume":/work:ro -v "$volume":/seed:ro \
+    --tmpfs "$RUN/clone:rw,size=1g,mode=1777" ${base_tmpfs[@]+"${base_tmpfs[@]}"} \
+    --tmpfs "$RUN/plan/out:rw,size=256m,mode=1777" --tmpfs "$RUN/plan/tmp:rw,size=256m,mode=1777" \
+    --tmpfs "$RUN/plan/home:rw,size=64m,mode=1777" --env-file "$TMPRUN/pass.env" \
+    --entrypoint /bin/bash "$runner_image" -c \
+    "cp -dR '$SEED/clone/.' '$RUN/clone/' && $seed_base && exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$5' --phase '$2' --index '$3' \"\$@\"" \
+    plan-pass ${base_args[@]+"${base_args[@]}"} "$4"
+}
+# Lines only the host may write; the container's output is untrusted and may not forge them
+host_only='^(plan summary:|plan pass mode:|plan pass budget:|host example )'
+
+# Plan phase: one container per example. Each block is kept apart until the end, because a
+# deferred merge base re-run fills in its base line later.
+start_proxy "$proxy_plan" plan.conf
+n=0 planned=0 exc=0 deferred=() examples=("$@")
+for ex in "$@"; do
+  n=$((n + 1)); blk="$TMPRUN/block.$n"
+  rem=$(left)
+  if [ "$rem" -le 0 ]; then
+    printf 'example: %s\nplan: budget\n' "$ex" > "$blk"; continue
+  fi
+  : > "$TMPRUN/example.out"
+  plan_container "$TMPRUN/example.out" plan "$n" "$ex" "$rem"
+  grep -Ev "$host_only" "$TMPRUN/example.out" > "$blk" || true
+  line="$(grep -m 1 '^plan: ' "$blk" || true)"
+  case "$line" in
+    'plan: planned'*) planned=$((planned + 1)) ;; # planned and planned-no-changes
+    'plan: exception:'*) exc=$((exc + 1)) ;;
+    'plan: code-error'*) [ -z "$base" ] || ! grep -qx 'base: deferred' "$blk" || deferred+=("$n") ;;
+    'plan: plan pass ended: credentials'*) break ;;
+  esac
+done
+save_proxy_log "$proxy_plan" proxy-plan.log
+
+# Merge base re-run, only for the code-errors: the base worktree and its init behind the init
+# proxy with no credentials, then its plan behind the plan proxy. One proxy runs at a time,
+# since both answer to the same name on the internal network.
+if [ "${#deferred[@]}" -gt 0 ]; then
+  start_proxy "$proxy_init" init.conf
+  for n in "${deferred[@]}"; do
+    rem=$(left)
+    [ "$rem" -gt 0 ] || break # base-plan then records the budget
+    ex="${examples[n - 1]}"
+    in_runner "$record/plan-pass-init.txt" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
+      -v "$volume":/work --entrypoint /bin/bash "$runner_image" -c \
+      "exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$rem' --phase base-init --index '$n' \"\$@\"" \
+      plan-pass --base "$base" "$ex"
+  done
+  save_proxy_log "$proxy_init" proxy-init.log
+  start_proxy "$proxy_plan" plan.conf
+  for n in "${deferred[@]}"; do
+    rem=$(left)
+    if [ "$rem" -le 0 ]; then echo 'base: budget' > "$TMPRUN/base.$n"; continue; fi
+    ex="${examples[n - 1]}"
+    : > "$TMPRUN/example.out"
+    plan_container "$TMPRUN/example.out" base-plan "$n" "$ex" "$rem"
+    grep -E '^base: ' "$TMPRUN/example.out" | head -n 1 > "$TMPRUN/base.$n" || true
+    [ -s "$TMPRUN/base.$n" ] || echo 'base: not available' > "$TMPRUN/base.$n"
+  done
+  save_proxy_log "$proxy_plan" proxy-plan.log
+fi
+
+# The record: each block headed by the host with its own index, so a forged block cannot claim
+# another example, and a deferred base line replaced by its re-run's result.
+out="$record/plan-pass.txt"
+printf 'plan pass mode: runner\nplan pass budget: %s minutes\n' "$budget_min" > "$out"
+n=0
+for ex in "$@"; do
+  n=$((n + 1))
+  [ -f "$TMPRUN/block.$n" ] || continue
+  printf 'host example %s: %s\n' "$n" "$ex" >> "$out"
+  if [ -f "$TMPRUN/base.$n" ]; then
+    awk -v f="$TMPRUN/base.$n" '$0 == "base: deferred" { while ((getline l < f) > 0) print l; next } { print }' \
+      "$TMPRUN/block.$n" >> "$out"
+  else
+    sed 's/^base: deferred$/base: not available/' "$TMPRUN/block.$n" >> "$out"
+  fi
+done
+echo "plan summary: $# examples, $planned planned, $exc exceptions, $(($# - planned - exc)) other" >> "$out"
+{
+  grep -o 'refused on filtered url "[^"]*"' "$record/proxy-plan.log" | sed -E 's/.*"([^"]*)"/\1/'
+  grep -o 'Request ([^)]*): CONNECT [^ ]*' "$record/proxy-plan.log" | sed -E 's/.*CONNECT //' | grep -v ':443$'
+} | sort -u > "$record/plan-refused-hosts.txt" || true
+
+# Leak scan over the whole record: exact credential values and the plan pass's evidence
+# patterns (record-scan.sh).
+printf '%s\n' "$leak_values" > "$TMPRUN/values"
+"$here/record-scan.sh" "$record" "$TMPRUN/values" > /dev/null
+rm -f "$TMPRUN/values"
+
+if [ -n "$(find "$record" -mindepth 1 ! -type f -print -quit)" ]; then
+  die "the record holds something other than a regular file: $record"
+fi
+tail -n 1 "$out"
