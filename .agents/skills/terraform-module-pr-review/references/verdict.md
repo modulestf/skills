@@ -15,12 +15,12 @@ Four signals. Three values each, except the review decision, which has a fourth.
 
 | Signal | pass | fail | unknown |
 |--------|------|------|---------|
-| Checks | Every check run and every commit status at the head SHA concluded success, neutral, or skipped; a combined status with no statuses is absent, and no runs with absent statuses passes | Any failure, timeout, cancellation, action required, or error state | Any run queued or in progress, or the reads failed |
+| Checks | The latest run of every check and every commit status at the head SHA concluded success, neutral, or skipped; a combined status with no statuses is absent, and no runs with absent statuses passes | Any failure, timeout, cancellation, action required, or error state | Any run queued or in progress, or the reads failed |
 | Threads | Every review thread is resolved, or there are none: the thread query returned none, or, without GraphQL, the review comments list was read to its last page and is empty | - | Resolution could not be read for a non-empty review comments list; without GraphQL, the review comments list could not be read to its last page; or threads or review comments were left unread because pagination stopped early |
 | Review decision | Latest non-comment review per reviewer other than the resolved login, none of them `CHANGES_REQUESTED`, at least one `APPROVED` | Any `CHANGES_REQUESTED` | The reviews list could not be read |
 | Mergeability | `mergeable` is true | `mergeable` is false | `mergeable` is null after a second read |
 
-The Checks signal reads the check runs left after the host's own check, when the task names it, is dropped per [github-io.md](github-io.md#check-runs). Commit statuses are all read.
+The Checks signal reads the check runs left after the host's own check, when the task names it, is dropped, and only the latest run of each check is kept, per [github-io.md](github-io.md#check-runs). Commit statuses are all read.
 
 Two deliberate holes in that table.
 
