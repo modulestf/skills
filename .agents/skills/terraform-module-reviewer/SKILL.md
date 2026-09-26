@@ -143,7 +143,7 @@ Rules: load [check-d-examples.md](references/check-d-examples.md) before running
 
 ### Check E: Profile Conventions
 
-Rules: load [check-e-profile.md](references/check-e-profile.md) before running this check. Reads the selected profile, its templates map, the quality gates (read, never run) and the matching workspace files. Judges template drift, release config, generated content against code, required files, `CHANGELOG.md` and migration notes, the release title's type, format, spelling and description, region literals, and configuration file formats. `rule_id` prefix: `profile.`.
+Rules: load [check-e-profile.md](references/check-e-profile.md) before running this check. Reads the selected profile, its templates map, the quality gates (read, never run) and the matching workspace files. Judges template drift, release config, generated content against code, required files, `CHANGELOG.md` and migration notes, the release title's type, spelling and description, region literals, and configuration file formats. `rule_id` prefix: `profile.`.
 
 ### Check F: Scope
 

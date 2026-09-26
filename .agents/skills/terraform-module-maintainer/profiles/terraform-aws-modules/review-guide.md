@@ -69,13 +69,13 @@ Source: [templates-map.md#what-not-to-copy](templates-map.md#what-not-to-copy) `
 
 The title becomes the commit message on a squash merge, and from there the release version and a `CHANGELOG.md` entry.
 
-- Shape: `<type>: <Description>`. The type is one of `fix`, `feat`, `docs`, `ci`, `chore`, and the description starts with an uppercase letter.
+- Shape: `<type>: <Description>`. The type is one of `fix`, `feat`, `docs`, `ci`, `chore`, and the description starts with an uppercase letter. The family's title workflow checks the shape, so it is not a review finding.
 - `feat` releases a minor version, `fix` a patch, the other types nothing. A `!` after the type, or a `BREAKING CHANGE:` trailer, releases a major.
 - The type matches the change. Wrong: a `!` with no break, `fix` on a change that adds an input, an output or a feature, `docs`, `ci` or `chore` on a change to module behaviour, `feat` on a change that only fixes behaviour, and a breaking change released with neither a `!` nor a `BREAKING CHANGE:` trailer. That list is complete. Any other pairing of a type the shape allows with a change is not a finding under this rule: `fix` on a change that only edits documentation, for one.
 - The description names the capability or the fix, and the submodule it lands on when it is not the root. `feat: Update module` fails.
 - A feature carries an example that demonstrates it.
 
-IDs: `profile.commit-message-format`, `profile.commit-type-mismatch`, `profile.title-uninformative`, `examples.feature-undemonstrated`.
+IDs: `profile.commit-type-mismatch`, `profile.title-uninformative`, `examples.feature-undemonstrated`.
 
 Source: [PROFILE.md#release-and-commit-conventions](PROFILE.md#release-and-commit-conventions) `8dd0fbf21215`
 
