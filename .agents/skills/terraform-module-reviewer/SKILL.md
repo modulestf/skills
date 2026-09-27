@@ -68,12 +68,14 @@ Do not restate guidance that the terraform-skill plugin or the maintainer refere
 
 ### Rule 2: Provider Schema From MCP, Never From Memory
 
-Any claim about a provider argument, attribute, nested block, nesting mode, or version comes from the Terraform MCP tools for the exact provider and version the module declares:
+Any claim about a provider argument, attribute, nested block, nesting mode, or version comes from the source the need list assigns to that type and version in Step 1: a host fact sheet, a host `absent` entry, a page from the host page cache, or the Terraform MCP tools for the exact provider and version the module declares, as the [Budget](references/large-changes.md#budget) says. Never from memory. The MCP tools:
 
 1. `mcp__terraform__get_latest_provider_version` for the provider
 2. `mcp__terraform__search_providers` at the version, then `mcp__terraform__get_provider_details` on the document it finds, for every resource and data source type touched by the change
 
 That returns the provider's documentation page for one type at one version: Required and Optional markers, nested blocks and exported attributes as documented, and no argument types or nesting modes. A claim that needs a type or a nesting mode, such as an ARN where an ID is expected, cannot be confirmed from it: the review never makes one, and a quoted one stays `review.quoted-claim-unverifiable`, never a finding.
+
+A host fact sheet is rendered from the provider's own schema and carries types and nesting modes, but no rule judges them: the review makes no type claim from a sheet either.
 
 Never assert from memory that an argument exists, is required, is deprecated, or has a given type. If the MCP tools are unavailable or the resource type is not found, the schema check does not run: see Rule 4. That reaches past Check B: every rule whose finding rests on a provider fact - a Required or Optional marker, a block name, a documented value set, an exported attribute, the documented behaviour of a data source - says so under **Provider facts** in its check file, and without that fact the rule is not evaluated, which is never a pass.
 

@@ -7,7 +7,9 @@
 
 In this file the schema is what Rule 2's tools return: the provider's documentation page for one type at one version. Check B takes from it the argument and block names, the Required and Optional markers, the names the prose calls a block (a "configuration block", or a section headed as a `Block`), the exported attributes, whether the type is documented at that version, and whatever the prose states: value sets, deprecations, conflicts between arguments. It never takes an argument type or a nesting mode from it, because the page has neither unless its prose says so. A section of its own does not make a name a block: the same nested name is headed ``### `posix_user` Block`` on one version's page and `### posix_user` on another's, and a nested object attribute gets a section too. A name the prose does not call a block is unknown, block or attribute. A rule below that would need one does not fire, and a quoted claim that needs one, such as an ARN where an ID is expected, stays `review.quoted-claim-unverifiable` under [quoted-claims.md](quoted-claims.md), never a finding.
 
-**Provider facts:** every rule below rests on the page. Without it, for any reason - the tools unreachable, the type not resolvable, the entry past the [budget](large-changes.md#budget) - none of them runs on that type, and the `review.check-not-run` of [Rule 4](../SKILL.md#rule-4-a-check-that-cannot-run-is-a-finding) names each `coverage.*` rule that had a block, output or literal to decide there, with the type and version.
+When the host gives a [host fact sheet](large-changes.md#budget) for a type, Check B takes the argument and block names, the required, optional, computed and deprecated flags and the exported attributes from it; a name it lists as a block is a block, and its minimum and maximum items are stated limits. Value sets, conflicts, validator limits, documented defaults and the other page facts come only from the page, which the run reads where [rule-facts.md](rule-facts.md) says a rule needs one. Its argument types and nesting modes enter no rule.
+
+**Provider facts:** every rule below rests on the page, or on the host fact sheet where [rule-facts.md](rule-facts.md) says the sheet serves it. Without it, for any reason - the tools unreachable, the type not resolvable, the entry past the [budget](large-changes.md#budget) - none of them runs on that type, and the `review.check-not-run` of [Rule 4](../SKILL.md#rule-4-a-check-that-cannot-run-is-a-finding) names each `coverage.*` rule that had a block, output or literal to decide there, with the type and version.
 
 ## Which blocks
 
@@ -26,8 +28,8 @@ An optional argument or block is an omission documented with a reason when the m
 The coverage rules are the maintainer's, not this skill's: [Coverage Checklist](../../terraform-module-maintainer/references/coverage-checklist.md) and [Schema Validation Guide](../../terraform-module-maintainer/references/schema-validation.md).
 
 **Fails when:**
-- A `resource` or `data` block sets an argument that the schema does not have, or repeats a block past a limit the page's prose states.
-- A `resource` or `data` block uses attribute syntax for a name the prose calls a block. Only then is it `coverage.block-attribute-mismatch`; for a name the prose does not call a block, either syntax is no finding.
+- A `resource` or `data` block sets an argument that the schema does not have, or repeats a block past a limit the page's prose or a host fact sheet states.
+- A `resource` or `data` block uses attribute syntax for a name the prose calls a block, or a host fact sheet lists as a block. Only then is it `coverage.block-attribute-mismatch`; for a name neither does, either syntax is no finding.
 - An argument or block the schema marks Required, on a `resource` or `data` block the change introduces or modifies, that no input the module exposes and no static value in the module can ever set. Where the caller supplies the value through an exposed input and the provider errors when they leave it out, that is the normal shape and not a finding. An `optional()` attribute or a `dynamic` block feeding a Required block is that shape too: the caller can set the value, and leaving it out fails at plan. An example that leaves the value out is `examples.example-broken` under Check D.
 - An optional argument of a resource introduced by the change is neither an exposed input nor an omission documented with a reason, as [Documented omissions](#documented-omissions) reads one.
 - A stable, user-useful computed attribute of a resource introduced by the change has no output.
@@ -40,7 +42,7 @@ The coverage rules are the maintainer's, not this skill's: [Coverage Checklist](
 Scope is the change. Pre-existing gaps in resources the change does not touch are out of scope unless the task asks for a full coverage pass.
 
 **Severity:**
-- CRITICAL when the `resource` or `data` block cannot be valid for ANY version the module allows: an argument absent from the latest schema, attribute syntax for a name the prose calls a block, or a block repeated past a stated limit. Nobody can apply it.
+- CRITICAL when the `resource` or `data` block cannot be valid for ANY version the module allows: an argument absent from the latest schema, attribute syntax for a name the prose or a host fact sheet calls a block, or a block repeated past a stated limit. Nobody can apply it.
 - HIGH when a required argument is unreachable, a deprecated argument is newly used, or mutually exclusive arguments are unguarded. HIGH too when the module defaults an argument the schema marks Required (`coverage.default-for-required-argument`).
 - HIGH when an added argument exists in the latest schema but is absent at the module's declared MINIMUM version.
 - HIGH when an output the change adds or touches is wrong in a mode the module supports, for example reading an attribute the provider sets on only one branch, so a caller indexes an empty element (`coverage.attribute-not-output`).

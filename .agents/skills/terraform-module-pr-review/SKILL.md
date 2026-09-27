@@ -138,6 +138,7 @@ What each step produces, and what happens when it fails. Mechanics: [github-io.m
 | [github-io.md](references/github-io.md) | Host reads and the two writes, a review or a commit comment: commands, the commit target, the GraphQL queries and their fallbacks, conversation comments, the handover contract |
 | [plan-pass.md](references/plan-pass.md) | The optional plan pass: opt-in, runner or laptop, run layout, environment, gates, commands, classes, evidence contract, limits. The pass itself is one script, [plan-pass.sh](references/plan-pass.sh), run in the isolated runner, [plan-runner/](references/plan-runner/README.md), when a container runtime is available |
 | [verify-pass.md](references/verify-pass.md) | The default pass as one script, [verify-pass.sh](references/verify-pass.sh): example directories, the version bump skip, environment, records, the merge base re-run, the JSON output, and checking a host's results |
+| [schema-pass.md](references/schema-pass.md) | A host step, one script, [schema-pass.sh](references/schema-pass.sh): provider versions per module directory and fact sheets rendered from a schema mirror, for the reviewer's Budget |
 | [verdict.md](references/verdict.md) | Host signals, the verdict ladder, the clamps on the action |
 | [comment-format.md](references/comment-format.md) | Section order, voice, the leak scan, a worked example |
 | [render-output.md](references/render-output.md) | The two files a render-only run with no conversation writes for the adapter that posts: the body and the result |

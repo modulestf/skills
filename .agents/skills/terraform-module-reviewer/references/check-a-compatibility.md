@@ -5,7 +5,7 @@
 
 **Reads:** the diff of `variables.tf`, `outputs.tf`, `versions.tf`, `main.tf` and sibling `.tf` files, and any submodule equivalents, with the bodies of any document the module generates; the module's declared version or release config to learn whether this change is declared as a major or breaking change. When the task carries the title the change will be released under, a `!` after its type, or a `BREAKING CHANGE:` trailer travelling with it, also counts as declaring the change breaking. When the task carries accompanying prose, the compatibility claims in its title and body, and in no other item, resolved under [quoted-claims.md](quoted-claims.md#compatibility-claims-come-from-the-title-and-the-body).
 
-**Provider facts:** `compat.provider-floor-raised` reads the old floor's pages to say whether the change uses anything absent there. Without them (Rule 2), it still reports the floor move from `versions.tf`, its `summary` says the old floor could not be read, and the area's `review.check-not-run` under [Rule 4](../SKILL.md#rule-4-a-check-that-cannot-run-is-a-finding) names `compat.provider-floor-raised` with each type and the old floor.
+**Provider facts:** `compat.provider-floor-raised` reads the old floor's host fact sheets, or its pages where the type has none, as the [Budget](large-changes.md#budget) says, to say whether the change uses anything absent there. Without them (Rule 2), it still reports the floor move from `versions.tf`, its `summary` says the old floor could not be read, and the area's `review.check-not-run` under [Rule 4](../SKILL.md#rule-4-a-check-that-cannot-run-is-a-finding) names `compat.provider-floor-raised` with each type and the old floor.
 
 **Fails when:**
 - A variable or output is removed or renamed.
