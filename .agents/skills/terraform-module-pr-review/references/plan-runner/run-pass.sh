@@ -3,7 +3,7 @@
 # a list of examples. See README.md in this directory.
 #
 # Usage:
-#   run-pass.sh --clone DIR --record DIR (--profile NAME | --credentials-env-file FILE)
+#   run-pass.sh --clone DIR --record DIR (--profile NAME --role-arn ARN | --credentials-env-file FILE)
 #               [--base SHA] [--budget-minutes N] [--tmp DIR] [--build] <example-dir>...
 #
 # --tmp names an existing directory, such as the pull request skill's run directory, to hold
@@ -24,9 +24,15 @@
 # proxy (AWS service endpoints), with the work volume read-only, and is the only place the
 # credentials go. With --base, an example whose plan is a code-error is then re-run at the
 # merge base in two more containers: base-init behind the init proxy, base-plan behind the
-# plan proxy. Examples that planned never touch the base. This script owns the credentials: it exports them on the host and passes
-# them to each plan container, and plan-pass.sh reads them there instead of calling
-# aws configure export-credentials itself.
+# plan proxy. Examples that planned never touch the base. This script owns the credentials:
+# for each plan container it issues a session on the review role --role-arn names, with the
+# profile, for 900 seconds, downscoped by the pinned session policy (../plan-session.sh), and
+# mounts it read-only into that container as a file, never as --env or --env-file, so Docker
+# keeps no copy in the container's configuration. The profile's own credentials never leave
+# the host. A session that cannot be issued gives the container no credentials, and the plan
+# pass ends at credentials there: there is no fallback to the profile's own. The container
+# reads the file into the plan pass's environment, and plan-pass.sh reads them there.
+# --credentials-env-file is for the smoke test: a fixed file of made-up session credentials.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -35,7 +41,7 @@ pass="$(cd "$here/.." && pwd)/plan-pass.sh"
 tag="$("$here/image-tag.sh")"
 runner_image="plan-runner:$tag"
 proxy_image="plan-egress-proxy:$tag"
-clone="" record="" profile="" cred_file="" base="" build=0 budget_min=120 tmp_parent=""
+clone="" record="" profile="" role_arn="" cred_file="" base="" build=0 budget_min=120 tmp_parent=""
 
 die() { echo "run-pass: $*" >&2; exit 2; }
 while [ $# -gt 0 ]; do
@@ -43,6 +49,7 @@ while [ $# -gt 0 ]; do
     --clone) clone="${2:-}"; shift 2 ;;
     --record) record="${2:-}"; shift 2 ;;
     --profile) profile="${2:-}"; shift 2 ;;
+    --role-arn) role_arn="${2:-}"; shift 2 ;;
     --credentials-env-file) cred_file="${2:-}"; shift 2 ;;
     --base) base="${2:-}"; shift 2 ;;
     --budget-minutes) budget_min="${2:-}"; shift 2 ;;
@@ -59,6 +66,9 @@ done
 [ ! -e "$record" ] && [ ! -L "$record" ] || die "--record must not exist yet: $record"
 [ -n "$profile" ] || [ -n "$cred_file" ] || die "--profile or --credentials-env-file is required"
 [ -z "$profile" ] || [ -z "$cred_file" ] || die "--profile and --credentials-env-file exclude each other"
+[ -z "$profile" ] || [[ "$role_arn" =~ ^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$ ]] ||
+  die "--profile needs --role-arn naming the review role; the plan pass does not run without it"
+[ -n "$profile" ] || [ -z "$role_arn" ] || die "--role-arn goes with --profile"
 # The profile name also goes to the plan pass, which redacts it from kept lines
 pname="${profile:-smoke}"
 [[ "$pname" =~ ^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$ ]] || die "invalid profile name"
@@ -118,20 +128,41 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# Credentials: exported on the host, session credentials only, renamed so that only the plan
-# pass reads them.
-src="$TMPRUN/creds.env"
-if [ -n "$profile" ]; then
-  aws configure export-credentials --profile="$profile" --format env-no-export \
-    --no-cli-pager < /dev/null > "$src"
-else
-  cp "$cred_file" "$src"
+# Credentials, for the plan containers only, renamed so that only the plan pass reads them.
+# values collects every credential value and the role's ARN and account id, for the leak scan.
+values="$TMPRUN/values"
+printf '%s\n' "$role_arn" "$(printf '%s\n' "$role_arn" | sed -nE 's/^arn:[^:]*:iam::([0-9]{12}):.*/\1/p')" > "$values"
+write_pass_env() { # AWS_* lines on stdin -> pass.env with PLAN_PASS_ names, values kept
+  grep -E '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=' | sed 's/^/PLAN_PASS_/' > "$TMPRUN/pass.env" || true
+  # 0644, not 0600: the container runs as uid 10001, not the file's owner, and on a native
+  # Linux daemon it could not read a 0600 file. The 0700 directory keeps other host users out.
+  chmod 0644 "$TMPRUN/pass.env"
+  sed -nE 's/^PLAN_PASS_AWS_[A-Z_]+=//p' "$TMPRUN/pass.env" >> "$values"
+}
+# One session per plan container, issued just before it starts. A session that cannot be
+# issued leaves pass.env empty: the container's plan pass ends at credentials.
+session="$(cd "$here/.." && pwd)/plan-session.sh"
+issue_session() {
+  [ -n "$profile" ] || return 0
+  local creds
+  # plan-session.sh's fixed reason reaches the operator on this script's standard error,
+  # never the record
+  if creds="$(bash "$session" "$profile" "$role_arn" "pofix-plan-$sfx")"; then
+    jq -r '"AWS_ACCESS_KEY_ID=\(.AccessKeyId)", "AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)", "AWS_SESSION_TOKEN=\(.SessionToken)"' <<< "$creds" | write_pass_env
+  else
+    echo "run-pass: no session for this plan container; its plan pass ends at credentials" >&2
+    : | write_pass_env
+  fi
+}
+if [ -n "$cred_file" ]; then
+  grep -Eq '^AWS_SESSION_TOKEN=.+' "$cred_file" ||
+    die "the credentials carry no session token, so they are long-lived keys; use a role or SSO profile"
+  write_pass_env < "$cred_file"
 fi
-grep -Eq '^AWS_SESSION_TOKEN=.+' "$src" ||
-  die "the credentials carry no session token, so they are long-lived keys; use a role or SSO profile"
-grep -E '^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=' "$src" | sed 's/^/PLAN_PASS_/' > "$TMPRUN/pass.env"
-leak_values="$(sed -nE 's/^AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)=//p' "$src")"
-rm -f "$src"
+# Run in the plan container: exports the three names from the mounted file and no other
+# line. Each line splits at its first '=', so a value keeps every '=' it has, a trailing
+# base64 pad included. smoke.sh runs this exact line, found by its marker.
+load_creds='while IFS= read -r l; do k=${l%%=*}; v=${l#*=}; case $k in PLAN_PASS_AWS_ACCESS_KEY_ID|PLAN_PASS_AWS_SECRET_ACCESS_KEY|PLAN_PASS_AWS_SESSION_TOKEN) export "$k=$v" ;; esac; done < /opt/plan-pass/creds.env' # creds-loader
 
 docker volume create "$volume" > /dev/null
 docker network create --internal "$net_int" > /dev/null
@@ -185,13 +216,14 @@ plan_container() { # output file, phase, index, example, budget left: the work v
     base_tmpfs=(--tmpfs "$RUN/base:rw,size=1g,mode=1777")
     seed_base="{ [ ! -d '$SEED/base' ] || cp -dR '$SEED/base/.' '$RUN/base/'; }"
   fi
+  issue_session
   in_runner "$1" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
     -v "$volume":/work:ro -v "$volume":/seed:ro \
     --tmpfs "$RUN/clone:rw,size=1g,mode=1777" ${base_tmpfs[@]+"${base_tmpfs[@]}"} \
     --tmpfs "$RUN/plan/out:rw,size=256m,mode=1777" --tmpfs "$RUN/plan/tmp:rw,size=256m,mode=1777" \
-    --tmpfs "$RUN/plan/home:rw,size=64m,mode=1777" --env-file "$TMPRUN/pass.env" \
+    --tmpfs "$RUN/plan/home:rw,size=64m,mode=1777" -v "$TMPRUN/pass.env":/opt/plan-pass/creds.env:ro \
     --entrypoint /bin/bash "$runner_image" -c \
-    "cp -dR '$SEED/clone/.' '$RUN/clone/' && $seed_base && exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$5' --phase '$2' --index '$3' \"\$@\"" \
+    "$load_creds && cp -dR '$SEED/clone/.' '$RUN/clone/' && $seed_base && exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$5' --phase '$2' --index '$3' \"\$@\"" \
     plan-pass ${base_args[@]+"${base_args[@]}"} "$4"
 }
 # Lines only the host may write; the container's output is untrusted and may not forge them
@@ -247,6 +279,7 @@ if [ "${#deferred[@]}" -gt 0 ]; then
   done
   save_proxy_log "$proxy_plan" proxy-plan.log
 fi
+rm -f "$TMPRUN/pass.env" # no plan container runs after this
 
 # The record: each block headed by the host with its own index, so a forged block cannot claim
 # another example, and a deferred base line replaced by its re-run's result.
@@ -272,9 +305,9 @@ echo "plan summary: $# examples, $planned planned, $exc exceptions, $(($# - plan
 
 # Leak scan over the whole record: exact credential values and the plan pass's evidence
 # patterns (record-scan.sh).
-printf '%s\n' "$leak_values" > "$TMPRUN/values"
-"$here/record-scan.sh" "$record" "$TMPRUN/values" > /dev/null
-rm -f "$TMPRUN/values"
+grep . "$values" > "$values.scan" || true
+"$here/record-scan.sh" "$record" "$values.scan" > /dev/null
+rm -f "$values" "$values.scan"
 
 if [ -n "$(find "$record" -mindepth 1 ! -type f -print -quit)" ]; then
   die "the record holds something other than a regular file: $record"

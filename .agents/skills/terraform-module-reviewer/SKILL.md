@@ -75,7 +75,7 @@ Any claim about a provider argument, attribute, nested block, nesting mode, or v
 
 That returns the provider's documentation page for one type at one version: Required and Optional markers, nested blocks and exported attributes as documented, and no argument types or nesting modes. A claim that needs a type or a nesting mode, such as an ARN where an ID is expected, cannot be confirmed from it: the review never makes one, and a quoted one stays `review.quoted-claim-unverifiable`, never a finding.
 
-A host fact sheet is rendered from the provider's own schema and carries types and nesting modes, but no rule judges them: the review makes no type claim from a sheet either.
+A host fact sheet is rendered from the provider's own schema and carries types and nesting modes, but no rule judges them: the review makes no type claim from a sheet either. A fix may copy a sheet's type into a new input, as the [Suggested Fix Contract](references/findings-schema.md#suggested-fix-contract) says; that names a value and judges nothing.
 
 Never assert from memory that an argument exists, is required, is deprecated, or has a given type. If the MCP tools are unavailable or the resource type is not found, the schema check does not run: see Rule 4. That reaches past Check B: every rule whose finding rests on a provider fact - a Required or Optional marker, a block name, a documented value set, an exported attribute, the documented behaviour of a data source - says so under **Provider facts** in its check file, and without that fact the rule is not evaluated, which is never a pass.
 

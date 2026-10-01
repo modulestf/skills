@@ -13,6 +13,7 @@
 # - credentials without a session token are refused before anything starts;
 # - an oversized file in the output directory is refused;
 # - with --base, only the example whose plan is a code-error is re-run at the merge base;
+# - no credential value is in the configuration of a plan container (docker inspect);
 # - the image tag is derived from the image files unless PLAN_RUNNER_TAG sets it;
 # - no container, network or volume of these runs is left behind.
 set -uo pipefail
@@ -91,7 +92,19 @@ cp -R "$here/smoke/attack" "$repo/examples/attack"
 git -C "$repo" add -A
 git -C "$repo" -c user.name=smoke -c user.email=smoke@example.com commit -q -m head
 mkdir -m 0700 "$rec/pass-tmp"
-"$here/run-pass.sh" --clone "$repo" --record "$rec/pass" --tmp "$rec/pass-tmp" --credentials-env-file "$creds" \
+# A docker wrapper for this run only: before run-pass.sh removes a runner container, it saves
+# that container's docker inspect output, so the check below sees every plan container.
+real_docker="$(command -v docker)"
+mkdir "$rec/shim"
+cat > "$rec/shim/docker" <<SHIM
+#!/bin/bash
+if [ "\$1 \$2" = "rm -f" ]; then
+  case "\$3" in plan-runner-*) "$real_docker" container inspect "\$3" >> "$rec/inspect.json" 2> /dev/null || true ;; esac
+fi
+exec "$real_docker" "\$@"
+SHIM
+chmod +x "$rec/shim/docker"
+PATH="$rec/shim:$PATH" "$here/run-pass.sh" --clone "$repo" --record "$rec/pass" --tmp "$rec/pass-tmp" --credentials-env-file "$creds" \
   --base "$basesha" examples/broken examples/sts examples/attack examples/broken examples/broken \
   examples/broken examples/broken examples/broken examples/broken examples/broken examples/broken \
   examples/broken examples/broken > /dev/null 2> "$rec/pass.err"
@@ -109,6 +122,20 @@ check "pass: the deferred base line was filled in" grep -qx 'base: reproduces at
 check "pass: no deferred base line is left" test -z "$(grep -x 'base: deferred' "$p/plan-pass.txt")"
 check "pass: init reached no AWS endpoint" test -z "$(grep 'amazonaws' "$p/proxy-init.log")"
 check "pass: no credential value in the record" test -z "$(grep -rl 'smoke-test-not-a-' "$p")"
+check "pass: a plan container was inspected with the credentials file mounted" grep -q '/opt/plan-pass/creds.env' "$rec/inspect.json"
+check "pass: no credential value in a plan container's configuration" test -z "$(grep 'smoke-test-not-a-' "$rec/inspect.json")"
+# The plan container's credentials loader, the exact line from run-pass.sh, run in the
+# runner image on values with a trailing '=' pad and an internal '='.
+loader="$(sed -n "s/^load_creds='\(.*\)' # creds-loader$/\1/p" "$here/run-pass.sh")"
+printf '%s\n' PLAN_PASS_AWS_ACCESS_KEY_ID=smoke-key PLAN_PASS_AWS_SECRET_ACCESS_KEY=smoke=sec=ret \
+  PLAN_PASS_AWS_SESSION_TOKEN=smoke-token= OTHER=x > "$rec/loader.env"
+chmod 0644 "$rec/loader.env"
+loaded="$(docker run --rm --network none --read-only --cap-drop ALL --user 10001:10001 \
+  -v "$rec/loader.env":/opt/plan-pass/creds.env:ro --entrypoint /bin/bash \
+  "plan-runner:$("$here/image-tag.sh")" -c "$loader && env | grep -E '^(PLAN_PASS_|OTHER=)' | sort" 2>&1)"
+check "loader: the line is found in run-pass.sh" test -n "$loader"
+check "loader: a value keeps its trailing pad and internal '='" test "$loaded" = "$(printf '%s\n' \
+  PLAN_PASS_AWS_ACCESS_KEY_ID=smoke-key PLAN_PASS_AWS_SECRET_ACCESS_KEY=smoke=sec=ret PLAN_PASS_AWS_SESSION_TOKEN=smoke-token=)"
 check "pass: the record holds regular files only" test -z "$(find "$p" -mindepth 1 ! -type f -print -quit)"
 check "pass: nothing is left under --tmp" test -z "$(find "$rec/pass-tmp" -mindepth 1 -print -quit)"
 # --tmp is where the private temporary directory goes: one that cannot be written to stops
@@ -119,6 +146,15 @@ mkdir -m 0500 "$rec/ro-tmp"
 ro_rc=$?
 check "pass: an unwritable --tmp stops the run" test "$ro_rc" -ne 0
 check "pass: an unwritable --tmp made no Docker object" test ! -e "$rec/ro-pass/run-id.txt"
+
+# A profile with no review role stops the run before any credential is read or any Docker
+# object is made: there is no plan pass on the profile's own credentials.
+"$here/run-pass.sh" --clone "$repo" --record "$rec/norole" --tmp "$rec/pass-tmp" --profile smoke \
+  examples/sts > "$rec/norole.out" 2>&1
+norole_rc=$?
+check "pass: a profile with no review role stops the run" test "$norole_rc" -eq 2
+check "pass: the refusal names the review role" grep -q 'needs --role-arn' "$rec/norole.out"
+check "pass: a profile with no review role made no Docker object" test ! -e "$rec/norole/run-id.txt"
 
 # The host leak scan, on a crafted record: exact values and every evidence pattern go, an
 # ordinary line stays.

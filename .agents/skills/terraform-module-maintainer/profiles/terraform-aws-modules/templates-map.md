@@ -32,6 +32,8 @@ Typography exception: `templates/github-workflows-lock.yml.template` keeps two h
 
 The template has pinned versions that may be stale. `pre-commit autoupdate` fixes this automatically.
 
+Source of the pins: `.pre-commit-config.yaml.template` and `github-workflows-pre-commit.yml.template` are the files of `terraform-aws-modules/terraform-aws-s3-bucket` at commit `5dc2f1f89743ab935114b0b039bc88044a672ca2` on `master`, read on 2026-10-01: pre-commit-terraform `v1.108.1`, pre-commit-hooks `v6.0.0`, terraform-docs `v0.24.0`, TFLint `v0.64.0`. The workflow template adds one thing upstream lacks: `HCLEDIT_VERSION: 0.2.17`, passed as `hcledit-version` to the pre-commit action, which pins the version that action installs by default at `v1.14.0`. To refresh, copy both files from a family repository's default branch, keep the hcledit pin, and record the repository and commit here.
+
 ## Skeletal Templates (Copy Then Customize)
 
 These templates contain placeholders that must be replaced with service-specific content.

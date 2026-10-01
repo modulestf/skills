@@ -61,7 +61,7 @@ The `rev:` pins in `.pre-commit-config.yaml` are expected to move ahead of the f
 
 IDs: `profile.generated-content-handwritten`, `profile.changelog-handwritten`.
 
-Source: [PROFILE.md#quality-gate](PROFILE.md#quality-gate) `b9258c2072a4`
+Source: [PROFILE.md#quality-gate](PROFILE.md#quality-gate) `f0e279a88d2f`
 Source: [templates-map.md#wrappers](templates-map.md#wrappers) `c12a32d6409b`
 Source: [templates-map.md#what-not-to-copy](templates-map.md#what-not-to-copy) `48a3302842e0`
 
@@ -198,7 +198,7 @@ IDs: `scope.profile-file`, `scope.pre-commit-hook`, `scope.tooling`, `scope.test
 
 Source: [scope.md#repository-files-and-tooling](scope.md#repository-files-and-tooling) `2fe5f939a85d`
 Source: [templates-map.md#static-files-copy-verbatim](templates-map.md#static-files-copy-verbatim) `55b509cfad03`
-Source: [templates-map.md#pre-commit-config-copy-then-update](templates-map.md#pre-commit-config-copy-then-update) `09d3b9cf0a53`
+Source: [templates-map.md#pre-commit-config-copy-then-update](templates-map.md#pre-commit-config-copy-then-update) `a58a407924a1`
 
 ## Not covered
 
@@ -209,6 +209,7 @@ Every level-2 section of the profile files this guide draws on is either a sourc
 | [What this profile defines](PROFILE.md#what-this-profile-defines) | An index of the profile, no rule | `c4bd02d22cf5` |
 | [What stays out of a profile](PROFILE.md#what-stays-out-of-a-profile) | About the profile itself, no rule | `4f65d3a61af9` |
 | [Adding another profile](PROFILE.md#adding-another-profile) | About the profile itself, no rule | `9f3a0f232873` |
+| [Documentation regeneration in an untrusted workspace](PROFILE.md#documentation-regeneration-in-an-untrusted-workspace) | Constants the maintainer uses to regenerate a documentation region in an untrusted workspace, no review rule | `930e64126f30` |
 | [Not a ban here](scope.md#not-a-ban-here-a-literal-only-one-caller-wants) | Points at rules above and at provider schema coverage, which needs the Terraform MCP tools | `27f0054a37bb` |
 | [Worked cases](scope.md#worked-cases) | Examples of the rules above, not rules | `049348f99abe` |
 | [Open questions](scope.md#open-questions) | Undecided, no rule | `d1ff50cd5d62` |

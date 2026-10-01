@@ -28,9 +28,9 @@ Exit 0 means the output was written. Exit 2 is a usage error or a refused input,
 
 | Input | What it is |
 |-------|------------|
-| `<run-dir>` | The absolute run directory [Workspace](github-io.md#workspace) printed, `<root>/pr-review.XXXXXX`, with the clone at head in `<run-dir>/clone`. Any other shape is refused |
+| `<run-dir>` | The absolute run directory [Workspace](github-io.md#workspace), or on a hosted run with host records [host-pass.md](host-pass.md#workspace), printed, `<root>/pr-review.XXXXXX`, with the clone at head in `<run-dir>/clone`. Any other shape is refused |
 | `--files` | The changed files list, below |
-| `--base` | The merge base, the full 40 character SHA from the compare read in [Workspace](github-io.md#workspace). Anything else is refused |
+| `--base` | The merge base, the full 40 character SHA from the compare read in [Workspace](github-io.md#workspace), or `merge_base` in the host records ([host-pass.md](host-pass.md#verification)). Anything else is refused |
 | `--out` | An absolute path in an existing directory. The script writes `<out>.tmp` and renames it, so the file is complete when it exists |
 | `--prefix` | The module root's repository-relative path, empty by default. An absolute path or one holding `..` is refused |
 

@@ -5,19 +5,26 @@ A local prototype of Option 1 in [docs/isolated-runner.md](../../../../../docs/i
 egress proxy with a host allowlist, a different one for each phase. It needs a local Docker
 runtime and no AWS infrastructure. `run-pass.sh` runs the whole plan pass,
 [plan-pass.sh](../plan-pass.sh) in runner mode, there for a list of examples; `run-plan.sh`
-runs a bare `init` and `plan` for one example, for the smoke test. The review workflow does
-not call either yet; its plan pass is the laptop one in [plan-pass.md](../plan-pass.md).
+runs a bare `init` and `plan` for one example, for the smoke test. The pull request skill's
+plan pass calls `run-pass.sh` when a container runtime is available, and runs the laptop pass
+otherwise ([Runner or laptop](../plan-pass.md#runner-or-laptop)). The GitHub Actions review
+workflow calls neither.
 
 ## Stated limits
 
 - **Head code sees the credentials and can use any allowed AWS service endpoint with
-  them.** During `plan` the credentials are environment variables in the container, visible
-  to anything running there and to `docker inspect` on the host for the length of the run,
-  or, after a SIGKILL of `run-pass.sh`, until the leftover container is removed (see below),
-  and they are the profile's own session credentials, not downscoped. Use only credentials
-  whose loss is acceptable until the review role and session policy in
-  [docs/isolated-runner.md](../../../../../docs/isolated-runner.md#credential-issuance-and-scope)
-  exist, which needs an AWS account change the owner approves.
+  them.** During `plan` the credentials are environment variables of the plan pass in the
+  container, visible to anything running there. In `run-pass.sh` they are a session on the
+  review role the user names, issued on the host for that one container, for 900 seconds,
+  downscoped by the pinned session policy and checked there with a write probe
+  ([plan-pass.md](../plan-pass.md#credentials)), never the profile's own credentials. The
+  policy's allow list is provisional until a CloudTrail trial run measures it, and what it
+  allows, configuration reads across the listed services, the head's code can use. `run-pass.sh` mounts them read-only as a
+  file and never passes them with `--env` or `--env-file`, so `docker inspect` shows only
+  the file's path. `run-plan.sh`, the bare runner for the smoke test, still passes the
+  profile's own credentials with `--env-file`, where `docker inspect` shows them until its
+  container is removed; use it only with made-up credentials or ones whose loss is
+  acceptable.
 - **A secret interleaved with other text passes every content scan.** The head's code in
   the plan container chooses what it prints. A credential split into fragments with other
   non-whitespace text between them matches none of the patterns and none of the values,
@@ -72,11 +79,11 @@ not call either yet; its plan pass is the laptop one in [plan-pass.md](../plan-p
   exact tag.
 - **A SIGKILL of `run-pass.sh` skips its cleanup.** Its containers, networks and volume
   stay; the pull request skill's Cleanup removes them by the exact names in `run-id.txt`.
-  A leftover plan container still holds the session credentials in its configuration,
-  from `--env-file`, readable with `docker inspect` on the host until Cleanup removes it
-  or the credentials expire.
-  Its private temporary directory, mode 0700, which holds the credentials file passed to
-  the plan containers, stays too. The skill passes `--tmp` with its run directory, so its
+  A leftover plan container holds no credential in its configuration; it names only the
+  mounted file.
+  Its private temporary directory, mode 0700, which holds that credentials file, stays too,
+  until Cleanup removes it or the credentials expire. A run that ends normally deletes the
+  file after the last plan container. The skill passes `--tmp` with its run directory, so its
   Cleanup deletes that directory with the run. Run by hand without `--tmp`, the directory
   is under `TMPDIR` and stays until it is deleted by hand.
 - **`run-plan.sh` gates nothing.** It is the bare runner for the smoke test. `run-pass.sh`
@@ -135,15 +142,17 @@ not call either yet; its plan pass is the laptop one in [plan-pass.md](../plan-p
   record, and cleanup removes exactly those names. None of the scripts removes Docker
   objects by a name prefix, by a filter or with a prune, so runs on the same Docker daemon
   do not disturb each other.
-- `init` never sees credentials. `plan` gets them from `--profile`, exported on the host
-  with `aws configure export-credentials`, or from `--credentials-env-file`. Either way the
-  script refuses to start unless they carry a session token, so long-lived access keys are
-  never used: use a role or SSO profile.
+- `init` never sees credentials. In `run-pass.sh`, `plan` gets a session on the review role
+  `--role-arn` names, issued on the host with `--profile` for each plan container
+  ([plan-pass.md](../plan-pass.md#credentials)). In `run-plan.sh`, the bare runner, it gets
+  the profile's own credentials, exported on the host with `aws configure
+  export-credentials`. `--credentials-env-file`, for the smoke test, is refused in both
+  unless it carries a session token, so long-lived access keys are never used.
 
 ## The plan pass in the runner
 
 ```bash
-./run-pass.sh --build --clone <clone> --record <dir> --profile <name> [--base <sha>] [--tmp <dir>] \
+./run-pass.sh --build --clone <clone> --record <dir> --profile <name> --role-arn <arn> [--base <sha>] [--tmp <dir>] \
   examples/complete examples/notification
 ```
 
@@ -185,10 +194,27 @@ the skill's plan pass whenever a container runtime is available.
   `plan pass budget: <n> minutes`. There is no cap on the number of examples. Each container
   gets what is left of the budget as the plan pass's `--budget`, and an example the budget
   does not reach is `plan: budget`. Each command keeps its own timeout.
-- **Credentials:** `run-pass.sh` owns them. It exports the profile's credentials on the host,
-  refuses them without a session token, and passes them only to the plan containers, as
-  `PLAN_PASS_AWS_*` variables. `plan-pass.sh` reads those in runner mode instead of calling
-  `aws configure export-credentials`, and still checks them with `sts get-caller-identity`.
+- **Credentials:** `run-pass.sh` owns them. `--profile` needs `--role-arn`, the review role
+  the user named; without it the script stops before anything runs, so the plan pass does
+  not run. Before each plan container it calls [plan-session.sh](../plan-session.sh) on the
+  host: a session on that role, issued with the profile, for 900 seconds, downscoped by the
+  pinned session policy. A session that cannot be issued gives that container no
+  credentials, and its plan pass ends at credentials; there is no fallback to the profile's
+  own credentials, which never leave the host. The container's plan pass checks the session
+  with `sts get-caller-identity` and an `ec2 create-vpc --dry-run` write probe that must be
+  refused, a canary that the session policy applied. `--credentials-env-file`, for the smoke test, takes a fixed file of made-up
+  session credentials instead and refuses one without a session token. The session goes
+  only to the plan containers, as a
+  file of `PLAN_PASS_AWS_*` lines in its private temporary directory, mounted read-only.
+  The container exports those three names, and no other line, before it starts the plan
+  pass. The Docker daemon, not the CLI, resolves that mount, so the temporary directory
+  (under `--tmp` or `TMPDIR`) must be a path the daemon sees: a shared path on Docker
+  Desktop, and not a remote `DOCKER_HOST` or a VM context without that mount, where Docker
+  creates an empty root-owned directory in place of the file, the credentials check fails
+  closed, and the directory may block cleanup. `plan-pass.sh` reads those in runner mode, and checks them
+  with `sts get-caller-identity` and the write probe. A session `plan-session.sh` could not
+  issue is reported to the operator on `run-pass.sh`'s standard error, with its fixed
+  reason, never in the record.
 - **Redaction:** the plan pass's evidence contract applies inside the runner, and its kept
   lines leave redacted. The head's code can still write to the container's output, so the
   host then runs `record-scan.sh` over every record file. It replaces each line that holds

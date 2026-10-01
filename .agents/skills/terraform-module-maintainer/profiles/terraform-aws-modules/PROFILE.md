@@ -122,7 +122,7 @@ defect: see [Quality gate](#quality-gate).
 ## Quality gate
 
 The gate is pre-commit-terraform, configured by the `.pre-commit-config.yaml` that
-[templates-map.md](templates-map.md) maps into the module. Nine hooks run, and between them
+[templates-map.md](templates-map.md) maps into the module. Eight hooks run, and between them
 they own the following:
 
 | Hook | What it owns |
@@ -135,7 +135,6 @@ they own the following:
 | `check-merge-conflict` | The absence of conflict markers |
 | `end-of-file-fixer` | A final newline on every file |
 | `trailing-whitespace` | The absence of trailing whitespace |
-| `mixed-line-ending` | LF line endings |
 
 Several artifacts in a module are generated and never authored. Text a person wrote in any
 of them is a defect, because the tool that owns it overwrites the file on its next run:
@@ -174,6 +173,80 @@ profile's; its pins are not.
 
 For running the gate - the order of the steps, what each hook's failure means, and how to
 read its output - see [quality-gates.md](../../references/quality-gates.md).
+
+## Documentation regeneration in an untrusted workspace
+
+The maintainer's
+[The Documentation Region](../../references/quality-gates.md#the-documentation-region)
+takes these constants from this file, and nothing from the workspace.
+
+- **Version.** terraform-docs `v0.24.0`: the version this family's pre-commit workflow
+  installs (`TERRAFORM_DOCS_VERSION` in `terraform-aws-s3-bucket` at commit
+  `5dc2f1f89743ab935114b0b039bc88044a672ca2`, the source of the pre-commit templates in
+  [templates-map.md](templates-map.md#pre-commit-config-copy-then-update)).
+- **Address.**
+  `https://github.com/terraform-docs/terraform-docs/releases/download/v0.24.0/terraform-docs-v0.24.0-<platform>.tar.gz`
+- **Archive SHA-256, per platform:**
+
+  | `<platform>` | SHA-256 |
+  |--------------|---------|
+  | `darwin-amd64` | `3c3f7f18f908457fd1209cbe341418f7f6bae78c08126cfbe8de0d1b06aa8781` |
+  | `darwin-arm64` | `f6b114f4b032f3f9202ab6c23bfd28c3c8e68aeeb8a8f12fc118bf2073081d71` |
+  | `linux-amd64` | `9005daf969de0b50134493a2c00078b49f5f5b39d021cda7c89bf4d4f3d776d3` |
+  | `linux-arm64` | `d12bd7b73c1fc9c64efc79f8157dd713dabd559f1ecf3cfc0f42e32279a155fd` |
+
+  These are the values of the release's own checksums file,
+  `https://github.com/terraform-docs/terraform-docs/releases/download/v0.24.0/terraform-docs-v0.24.0.sha256sum`,
+  read on 2026-09-25 and again on 2026-10-01 with the same values. The darwin-arm64 archive
+  was downloaded and matched on 2026-09-25. Any other platform has no
+  recorded hash, so it takes the fallback.
+- **Recognised marker pairs.** The template pair `<!-- BEGIN_TF_DOCS -->` and
+  `<!-- END_TF_DOCS -->`, and the older hook pair
+  `<!-- BEGINNING OF PRE-COMMIT-TERRAFORM DOCS HOOK -->` and
+  `<!-- END OF PRE-COMMIT-TERRAFORM DOCS HOOK -->`. A `README.md` carries one pair or the other,
+  and the configuration below takes that pair in its template. The older hook pair takes the
+  fallback, with the reason "no parity fixture for this marker pair", until a parity fixture
+  for it is recorded below; only the template pair is regenerated.
+- **Configuration text,** the gate's effective settings, written to `tfdocs-config-<n>.yml`
+  with the directory's marker pair in the template:
+
+  ```yaml
+  formatter: "markdown table"
+  header-from: main.tf
+  footer-from: ""
+  recursive:
+    enabled: false
+  output:
+    file: README.md
+    mode: inject
+    template: |-
+      <!-- BEGIN_TF_DOCS -->
+      {{ .Content }}
+      <!-- END_TF_DOCS -->
+  sort:
+    enabled: true
+    by: name
+  settings:
+    lockfile: false
+  ```
+
+  This reproduces the `terraform_docs` hook with `--args=--lockfile=false`. `header-from`
+  names `main.tf`, the gate's own default, because terraform-docs `v0.24.0` refuses an empty
+  value (`value of '--header-from' can't be empty`). It reads the copy of `main.tf` in the run
+  directory, never the workspace.
+
+Parity is a trusted-fixture check. Measured on 2026-09-25 on a copy of `terraform-aws-s3-bucket`
+pull request 410's unmodified head, which commits no terraform-docs configuration: all 19
+documentation regions, at the root and in every `modules/*` and `examples/*` directory, came
+out byte for byte unchanged. Measured again on 2026-10-01 at that head
+(`30cd3728d16cc5a1e1fa25d0d891015b6e4a0ada`) with the maintainer's
+`references/terraform-docs-pass.sh` and the pinned darwin-arm64 binary: the same 19 regions
+unchanged, and a changed variable description reached its row. Every one of them carries the
+template pair, so the measurement covered that pair alone; the older hook pair has no
+measured fixture yet.
+
+`wrappers/` is never regenerated in an untrusted workspace. A fix that makes a wrapper file
+stale leaves it reported stale, for the owner's checkout or CI.
 
 ## Release and commit conventions
 

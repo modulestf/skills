@@ -6,7 +6,7 @@
 #   <bash|zsh> /abs/path/plan-pass.sh g0 <run-dir> [base]
 #       G0 over the clone, or with "base" over the base worktree, into <run-dir>/g0.txt or
 #       <run-dir>/g0-base.txt. Run it before any terraform command touches that tree.
-#   <bash|zsh> /abs/path/plan-pass.sh plan <run-dir> <profile> [--mode laptop|runner] [--base <sha>] <example-dir>...
+#   <bash|zsh> /abs/path/plan-pass.sh plan <run-dir> <profile> [--role-arn <arn>] [--mode laptop|runner] [--base <sha>] <example-dir>...
 #       The plan pass over the named example directories, repository-relative, in the order
 #       given, at most 12 in laptop mode. Prints "plan pass mode:" once, then the record lines per example on
 #       standard output: "example:", "plan:", "scope:", "modules:" and "base:", and a
@@ -19,6 +19,9 @@
 #       --phase plan --index <n> <example-dir> then plans that one example from the saved
 #       state and prints its record lines, with no summary. The runner runs each phase in its
 #       own container behind its own egress proxy (plan-pass.md, Modes).
+#       Laptop mode needs --role-arn: the plan credentials are a session on that review role,
+#       downscoped by plan-session-policy.json and issued by plan-session.sh, never the
+#       profile's own (plan-pass.md, Credentials). Runner mode gets its session from the runner.
 #   <bash|zsh> /abs/path/plan-pass.sh gates <run-dir> <laptop|runner> <clone|downloaded>
 #       The per-file gates alone, over the absolute .tf paths on standard input. Read only,
 #       for the fixtures.
@@ -289,10 +292,12 @@ fi
 
 PROFILE=${3:-}
 shift 3 2>/dev/null || { echo "plan pass not run: arguments missing"; exit 0; }
-BASESHA=; GMODE=laptop; PHASE=; INDEX=; BUDGET=
+BASESHA=; GMODE=laptop; PHASE=; INDEX=; BUDGET=; ROLE_ARN=
+HERE="$(cd "$(dirname "$0")" && pwd -P)"
 while :; do
   case "${1:-}" in
     --base) BASESHA=${2:-}; shift 2 2>/dev/null || shift ;;
+    --role-arn) ROLE_ARN=${2:-}; shift 2 2>/dev/null || shift ;;
     --mode) GMODE=${2:-}; shift 2 2>/dev/null || shift ;;
     --phase) PHASE=${2:-}; shift 2 2>/dev/null || shift ;;
     --index) INDEX=${2:-}; shift 2 2>/dev/null || shift ;;
@@ -320,10 +325,18 @@ if [ "$GMODE" = runner ] && [ ! -e /.dockerenv ] && [ ! -e /run/.containerenv ];
   echo "plan pass not run: runner mode outside a container"; exit 0
 fi
 printf '%s\n' "$PROFILE" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$' || { echo "plan pass not run: profile not opted in"; exit 0; }
+# Laptop mode plans only with a session on a named review role; the runner issues its own
+if [ "$GMODE" = laptop ]; then
+  printf '%s\n' "$ROLE_ARN" | grep -Eqx 'arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+' ||
+    { echo "plan pass not run: no review role"; exit 0; }
+  [ "${#ROLE_ARN}" -le 2048 ] || { echo "plan pass not run: no review role"; exit 0; }
+  [ -f "$HERE/plan-session.sh" ] && [ -f "$HERE/plan-session-policy.json" ] ||
+    { echo "plan pass not run: plan-session.sh missing"; exit 0; }
+fi
 for t in terraform jq aws perl git; do
   command -v "$t" > /dev/null 2>&1 || { echo "plan pass not run: $t missing"; exit 0; }
 done
-aws --version 2>&1 | grep -Eq '^aws-cli/2\.(9|[1-9][0-9])\.' || { echo "plan pass not run: aws configure export-credentials missing"; exit 0; }
+aws --version 2>&1 | grep -Eq '^aws-cli/2\.' || { echo "plan pass not run: AWS CLI version 2 missing"; exit 0; }
 if [ -n "$PHASE" ] && [ "$PHASE" != init ]; then
   [ -d "$RUN/plan/state" ] || { echo "plan pass not run: no saved init phase"; exit 0; }
 else
@@ -378,7 +391,9 @@ fi
 
 TFDIR="$(dirname "$(command -v terraform)")"
 AWSBIN="$(command -v aws)"
-AK=; SK=; ST=; LEAKS=
+AK=; SK=; ST=
+# The role ARN and its account id are never recorded: any line holding one is dropped
+LEAKS="$ROLE_ARN $(printf '%s\n' "$ROLE_ARN" | sed -nE 's/^arn:[^:]*:iam::([0-9]{12}):.*/\1/p')"
 set_env() { # example key
   TFENV=(env -i PATH="/usr/bin:/bin:$TFDIR" HOME="$PLAN/home" TMPDIR="$PLAN/tmp"
     TF_DATA_DIR="$PLAN/data/$1" TF_PLUGIN_CACHE_DIR="$PLAN/cache"
@@ -397,14 +412,20 @@ get_creds() {
     [ -n "$RAK" ] && [ -n "$RSK" ] && [ -n "$RST" ] || return 1
     AK=$RAK; SK=$RSK; ST=$RST
   else
-    CREDS="$(perl -e 'alarm 30; exec @ARGV' aws configure export-credentials --profile="$PROFILE" --format process --no-cli-pager < /dev/null)" || return 1
+    # A session on the review role, downscoped by the pinned policy; never the profile's own
+    # Its reason on standard error is for the operator; this output is the record
+    CREDS="$(bash "$HERE/plan-session.sh" "$PROFILE" "$ROLE_ARN" pofix-plan-pass 2> /dev/null)" || return 1
     AK="$(printf '%s' "$CREDS" | jq -er .AccessKeyId)" || return 1
     SK="$(printf '%s' "$CREDS" | jq -er .SecretAccessKey)" || return 1
-    ST="$(printf '%s' "$CREDS" | jq -r '.SessionToken // empty')"
+    ST="$(printf '%s' "$CREDS" | jq -er .SessionToken)" || return 1
   fi
   CREDS=; LEAKS="$LEAKS $AK $SK $ST"
   set_env none
-  "${TFENV[@]}" perl -e 'alarm 30; exec @ARGV' "$AWSBIN" sts get-caller-identity --no-cli-pager < /dev/null > /dev/null 2>&1
+  "${TFENV[@]}" perl -e 'alarm 30; exec @ARGV' "$AWSBIN" sts get-caller-identity --no-cli-pager < /dev/null > /dev/null 2>&1 || return 1
+  # The write probe: a dry-run write the session must not be allowed. Only
+  # UnauthorizedOperation goes on; DryRunOperation, any other answer or a timeout ends the pass.
+  PROBE="$("${TFENV[@]}" perl -e 'alarm 30; exec @ARGV' "$AWSBIN" ec2 create-vpc --cidr-block 10.255.0.0/16 --dry-run --no-cli-pager < /dev/null 2>&1)"
+  case "$PROBE" in *'(UnauthorizedOperation)'*) PROBE= ;; *) PROBE=; return 1 ;; esac
 }
 
 scope() { # absolute example directory
