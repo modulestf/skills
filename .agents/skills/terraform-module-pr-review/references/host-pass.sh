@@ -25,8 +25,13 @@
 #       Checks a directory the checks or the run command wrote: the exact file set, regular
 #       files, the size cap, the exact keys and values and the head SHA; for checks.json the
 #       signal, for task.md the head revision line and one block. A records directory may
-#       also hold verify.json, the verify job's results, which verify-pass.sh checks. Prints "checks accepted"
+#       also hold verify.json, the verify job's results, which verify-pass.sh checks, and
+#       plan-hosted.json, the plan job's record, checked here. Prints "checks accepted"
 #       or "records accepted" and exits 0, or "... rejected: <reason>" and exits 1.
+#   host-pass.sh check-plan <file> <records dir> --head <sha>
+#       Checks a plan-hosted.json outside the records, against the records' host.json and
+#       files.json, by the same rules. Prints "plan accepted" and exits 0, or
+#       "plan rejected: <reason>" and exits 1. Exit 2 is a usage error.
 #
 # Environment: GH_TOKEN, a read-only token. run also needs openssl for the block suffix. Exit 2 is a usage error or a refused
 # input; nothing is written. No check name or status context reaches the output.
@@ -195,7 +200,10 @@ cmd_check() {
   [[ "$head" =~ $sha_re ]] || die "--head must be a 40 character SHA"
   local names=""
   [ -d "$dir" ] && [ ! -L "$dir" ] && names="$(cd "$dir" && LC_ALL=C ls -A)"
-  if [ "$names" = "files.json${NL}host.json${NL}task.md" ] || [ "$names" = "files.json${NL}host.json${NL}task.md${NL}verify.json" ]; then
+  # A records directory: the three files, and optionally plan-hosted.json and verify.json
+  local core
+  core="$(printf '%s\n' "$names" | grep -vxE 'plan-hosted\.json|verify\.json')"
+  if [ "$core" = "files.json${NL}host.json${NL}task.md" ]; then
     check_records "$dir" "$head"
   else
     check_dir "$dir" "$head"
@@ -537,24 +545,74 @@ JQ
   jq -r '"host pass: records for \(.repo)#\(.number) at \(.head_sha), threads \(.signals.threads), review decision \(.signals.review_decision), mergeability \(.signals.mergeability), \(.could_not_run | length) checks could not run"' "$out/host.json"
 }
 
-check_records() { # dir, head -> prints the verdict, returns 0 when accepted
-  local dir="$1" head="$2" f s cap
-  reject() { echo "records rejected: $1"; return 1; }
-  for f in files.json host.json task.md verify.json; do
-    [ "$f" != verify.json ] || [ -e "$dir/$f" ] || [ -L "$dir/$f" ] || continue
-    [ -f "$dir/$f" ] && [ ! -L "$dir/$f" ] || { reject "not a regular file"; return 1; }
-    cap=$CAP; [ "$f" = host.json ] || [ "$f" = verify.json ] || cap=$CAP_RECORDS
-    [ "$(wc -c < "$dir/$f")" -le "$cap" ] || { reject "over the size cap"; return 1; }
-  done
-  jq -e 'type == "array" and all(.[]; type == "object"
+# plan-hosted.json, the hosted plan job's record (plan-pass.md, Hosted runner): the exact keys,
+# every type and class, an empty module root prefix, head and merge base equal to the checked
+# ones, and examples the runner plans for this change, each once. Prints "ok" or a fixed
+# reason. The example rule is a consistency check, not a security boundary.
+# shellcheck disable=SC2016 # a jq program
+PLAN_HOSTED_JQ='
+def nat: type == "number" and . >= 0 and . == floor and . <= 999999999;
+def classes: ["planned", "planned-no-changes", "code-error", "environment", "needs input",
+  "output unrecognised", "budget", "plan pass ended: credentials", "plan gate G0", "plan gate G1",
+  "plan gate G2", "plan gate G3", "exception: example assumes a role in another account",
+  "exception: needs a Docker daemon"];
+def base_results: ["reproduces at base", "new under this change",
+  "new under this change (absent at base)", "not available"];
+def part($base): type == "object" and keys == ["class", "plan"]
+  and (.class | type == "string" and (IN(classes[]) or ($base and IN(base_results[]))))
+  and (.plan == null or (.class == "planned" and (.plan | type == "object"
+       and keys == ["add", "change", "destroy"] and all(.[]; nat))));
+"examples/" as $ex
+| ([$f[0][] | .filename, (.previous_filename // empty)]) as $names
+| ([$names[] | select(startswith($ex)) | .[($ex | length):] | split("/")[0] | select(length > 0) | $ex + .]) as $touched
+| any($names[]; endswith(".tf") and (startswith($ex) | not)) as $outside
+| if ($p | length) != 1 or ($p[0] | type) != "object" then "plan record content"
+  elif $h[0].prefix != "" then "plan record prefix"
+  elif $p[0].head != $head then "plan record head"
+  elif $h[0].merge_base == null or $p[0].merge_base != $h[0].merge_base then "plan record merge base"
+  elif ($p[0] | (keys != ["examples", "head", "merge_base", "refused_hosts", "schema_version"])
+        or .schema_version != 1 or (.refused_hosts | nat | not) or (.examples | type != "array")
+        or (.examples | all(.[]; type == "object" and keys == ["base", "head", "path"]
+              and (.path | type == "string" and startswith($ex)
+                   and (.[($ex | length):] | test("^[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")))
+              and (.head | part(false)) and (.base == null or (.base | part(true)))) | not))
+    then "plan record content"
+  elif ($p[0].examples | map(.path) | (unique | length) != length) then "plan record examples"
+  elif ($outside | not) and ($p[0].examples | any(.[]; .path | IN($touched[]) | not)) then "plan record examples"
+  else "ok" end
+'
+
+# shellcheck disable=SC2016 # a jq program
+FILES_JQ='type == "array" and all(.[]; type == "object"
       and ((keys - ["filename", "status", "previous_filename", "patch"]) == [])
       and (.filename | type == "string" and length > 0 and (test("[\\x00-\\x1f\\x7f]") | not))
       and (.status | type == "string" and test("^[a-z]+$"))
       and (.previous_filename == null or (.previous_filename | type == "string" and (test("[\\x00-\\x1f\\x7f]") | not)))
-      and (.patch == null or (.patch | type == "string")))' "$dir/files.json" > /dev/null 2>&1 ||
+      and (.patch == null or (.patch | type == "string")))'
+plan_reason() { # plan file, records dir, head -> prints "ok" or a fixed reason
+  [ -f "$1" ] && [ ! -L "$1" ] || { echo "not a regular file"; return; }
+  [ "$(wc -c < "$1")" -le "$CAP" ] || { echo "over the size cap"; return; }
+  jq -n -r --arg head "$3" --slurpfile p "$1" --slurpfile h "$2/host.json" \
+    --slurpfile f "$2/files.json" "$PLAN_HOSTED_JQ" 2> /dev/null || echo "plan record content"
+}
+
+check_records() { # dir, head -> prints the verdict, returns 0 when accepted
+  local dir="$1" head="$2" f s cap
+  reject() { echo "records rejected: $1"; return 1; }
+  for f in files.json host.json task.md verify.json plan-hosted.json; do
+    case "$f" in verify.json | plan-hosted.json) [ -e "$dir/$f" ] || [ -L "$dir/$f" ] || continue ;; esac
+    [ -f "$dir/$f" ] && [ ! -L "$dir/$f" ] || { reject "not a regular file"; return 1; }
+    cap=$CAP; case "$f" in files.json | task.md) cap=$CAP_RECORDS ;; esac
+    [ "$(wc -c < "$dir/$f")" -le "$cap" ] || { reject "over the size cap"; return 1; }
+  done
+  jq -e "$FILES_JQ" "$dir/files.json" > /dev/null 2>&1 ||
     { reject "unexpected files list"; return 1; }
   RJ -e --arg head "$head" 'include "host-records"; valid_host($head)' "$dir/host.json" > /dev/null 2>&1 ||
     { reject "unexpected content"; return 1; }
+  if [ -e "$dir/plan-hosted.json" ]; then
+    s="$(plan_reason "$dir/plan-hosted.json" "$dir" "$head")"
+    [ "$s" = ok ] || { reject "$s"; return 1; }
+  fi
   grep -qxF "Head revision: $head" "$dir/task.md" || { reject "head revision"; return 1; }
   # The incremental lines, when present: four lines in order right after the head revision.
   local n
@@ -924,8 +982,39 @@ cmd_incremental() { # --records <dir> --prior <dir>: the incremental lines into 
   echo "incremental: task lines written, $(jq '.scope | length' "$pri/meta.json") files in scope"
 }
 
+# check-plan <file> <records dir> --head <sha>: plan-hosted.json alone, against the records'
+# host.json and files.json, by the same rules check applies to one inside the records. The
+# review job runs it before it copies the file in, so a plan record that no longer fits, as
+# after the base moved during the plan, drops only the plan and never the records.
+cmd_check_plan() {
+  local file="${1-}" dir="${2-}" head="" r
+  shift 2 || die "usage: host-pass.sh check-plan <file> <records dir> --head <sha>"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2-}"; shift 2 || die "--head needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  [[ "$head" =~ $sha_re ]] || die "--head must be a 40 character SHA"
+  [ -n "$file" ] && [ -n "$dir" ] || die "usage: host-pass.sh check-plan <file> <records dir> --head <sha>"
+  reject() { echo "plan rejected: $1"; exit 1; }
+  [ -d "$dir" ] && [ ! -L "$dir" ] || reject "records not a directory"
+  for r in host.json files.json; do
+    [ -f "$dir/$r" ] && [ ! -L "$dir/$r" ] || reject "records not a regular file"
+  done
+  [ "$(wc -c < "$dir/host.json")" -le "$CAP" ] && [ "$(wc -c < "$dir/files.json")" -le "$CAP_RECORDS" ] ||
+    reject "records over the size cap"
+  jq -e "$FILES_JQ" "$dir/files.json" > /dev/null 2>&1 || reject "records files list"
+  RJ -e --arg head "$head" 'include "host-records"; valid_host($head)' "$dir/host.json" > /dev/null 2>&1 ||
+    reject "records content"
+  r="$(plan_reason "$file" "$dir" "$head")"
+  [ "$r" = ok ] || reject "$r"
+  echo "plan accepted"
+}
+
 case "${1-}" in
   checks) shift; cmd_checks "$@" ;;
+  check-plan) shift; cmd_check_plan "$@" ;;
   run) shift; cmd_run "$@" ;;
   check) shift; cmd_check "$@" ;;
   prior) shift; cmd_prior "$@" ;;
@@ -933,5 +1022,5 @@ case "${1-}" in
   record) shift; cmd_record "$@" ;;
   accept) shift; cmd_accept "$@" ;;
   incremental) shift; cmd_incremental "$@" ;;
-  *) die "usage: host-pass.sh checks|run|check|prior|check-prior|record|accept|incremental ..." ;;
+  *) die "usage: host-pass.sh checks|run|check|check-plan|prior|check-prior|record|accept|incremental ..." ;;
 esac

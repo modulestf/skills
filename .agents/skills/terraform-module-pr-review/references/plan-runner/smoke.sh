@@ -13,6 +13,9 @@
 # - credentials without a session token are refused before anything starts;
 # - an oversized file in the output directory is refused;
 # - with --base, only the example whose plan is a code-error is re-run at the merge base;
+# - run-pass.sh's network check, behind each proxy, finds every path closed and both positive
+#   controls held, and stops the run before any session when IPv6 is on, a path is open or a
+#   control fails;
 # - no credential value is in the configuration of a plan container (docker inspect);
 # - the image tag is derived from the image files unless PLAN_RUNNER_TAG sets it;
 # - no container, network or volume of these runs is left behind.
@@ -92,23 +95,63 @@ cp -R "$here/smoke/attack" "$repo/examples/attack"
 git -C "$repo" add -A
 git -C "$repo" -c user.name=smoke -c user.email=smoke@example.com commit -q -m head
 mkdir -m 0700 "$rec/pass-tmp"
-# A docker wrapper for this run only: before run-pass.sh removes a runner container, it saves
-# that container's docker inspect output, so the check below sees every plan container.
-real_docker="$(command -v docker)"
+# A docker wrapper for these runs only: before run-pass.sh removes a runner container, it saves
+# that container's docker inspect output, so the check below sees every plan container. With
+# $rec/shim-mode it also fakes a fault for the network check: "ipv6" answers that IPv6 is on
+# for the run networks, "open-path" points the probe's gateway at the proxy, which listens,
+# and "plan-control" gives the plan-phase probe a positive control its proxy refuses.
 mkdir "$rec/shim"
-cat > "$rec/shim/docker" <<SHIM
+cat > "$rec/shim/docker" <<'SHIM'
 #!/bin/bash
-if [ "\$1 \$2" = "rm -f" ]; then
-  case "\$3" in plan-runner-*) "$real_docker" container inspect "\$3" >> "$rec/inspect.json" 2> /dev/null || true ;; esac
+mode="$(cat "$SMOKE_REC/shim-mode" 2> /dev/null)"
+if [ "$1 $2" = "rm -f" ]; then
+  case "$3" in plan-runner-*) "$SMOKE_DOCKER" container inspect "$3" >> "$SMOKE_REC/inspect.json" 2> /dev/null || true ;; esac
 fi
-exec "$real_docker" "\$@"
+if [ "$mode" = ipv6 ] && [ "$1 $2 $3 $4" = "network inspect -f {{.EnableIPv6}}" ]; then
+  echo true; echo true; exit 0
+fi
+if [ "$mode" = open-path ] && [ "$1" = run ]; then
+  args=() prev=""
+  for a in "$@"; do
+    if [ "$prev" = --gateway ]; then args+=(proxy); else args+=("$a"); fi
+    prev="$a"
+  done
+  exec "$SMOKE_DOCKER" "${args[@]}"
+fi
+if [ "$mode" = plan-control ] && [ "$1" = run ]; then
+  args=() prev=""
+  for a in "$@"; do
+    if [ "$prev" = --allowed ] && [ "$a" = sts.us-east-1.amazonaws.com ]; then args+=(example.com); else args+=("$a"); fi
+    prev="$a"
+  done
+  exec "$SMOKE_DOCKER" "${args[@]}"
+fi
+exec "$SMOKE_DOCKER" "$@"
 SHIM
 chmod +x "$rec/shim/docker"
+export SMOKE_REC="$rec" SMOKE_DOCKER="$(command -v docker)"
 PATH="$rec/shim:$PATH" "$here/run-pass.sh" --clone "$repo" --record "$rec/pass" --tmp "$rec/pass-tmp" --credentials-env-file "$creds" \
   --base "$basesha" examples/broken examples/sts examples/attack examples/broken examples/broken \
   examples/broken examples/broken examples/broken examples/broken examples/broken examples/broken \
   examples/broken examples/broken > /dev/null 2> "$rec/pass.err"
 p="$rec/pass"
+for ph in init plan; do
+  nc="$p/network-check-$ph.txt"
+  check "pass: $ph: the network check found every path closed and both controls held" \
+    test "$(tail -n 1 "$nc")" = "end network check" -a "$(grep -vcE '^(closed|ok) ' "$nc")" -eq 1 -a "$(grep -c '^ok control ' "$nc")" -eq 2
+  check "pass: $ph: the proxy was reached directly" grep -qx 'ok control direct proxy:8888' "$nc"
+  check "pass: $ph: the probe saw one network interface" grep -qx 'closed interfaces: one up' "$nc"
+  check "pass: $ph: the probe saw no IPv4 default route" grep -qx 'closed route ipv4: no default' "$nc"
+  check "pass: $ph: an IP-literal CONNECT through the proxy is refused" grep -qx 'closed proxy CONNECT 1.1.1.1:443' "$nc"
+  check "pass: $ph: external names do not resolve" grep -qx 'closed dns example.com' "$nc"
+  check "pass: $ph: the gateway, docker0 and the IPv4 metadata address are closed on six ports each" \
+    test "$(grep -cE '^closed direct [0-9.]+:(22|80|443|2375|2376|8888)$' "$nc")" -ge 19
+  check "pass: $ph: the IPv6 metadata address is closed" grep -qx 'closed direct fd00:ec2::254:80' "$nc"
+done
+check "pass: init: the init proxy passes the registry" grep -qx 'ok control proxy CONNECT registry.terraform.io:443' "$p/network-check-init.txt"
+check "pass: init: the init proxy refuses AWS" grep -qx 'closed proxy CONNECT sts.us-east-1.amazonaws.com:443' "$p/network-check-init.txt"
+check "pass: plan: the plan proxy passes an AWS endpoint" grep -qx 'ok control proxy CONNECT sts.us-east-1.amazonaws.com:443' "$p/network-check-plan.txt"
+check "pass: plan: the plan proxy refuses the registry" grep -qx 'closed proxy CONNECT registry.terraform.io:443' "$p/network-check-plan.txt"
 check "pass: init phase readied both examples" grep -qx 'init: examples/attack: ready' "$p/plan-pass-init.txt"
 check "pass: plan phase checked the credentials through the plan proxy" grep -q 'CONNECT sts\.[a-z0-9-]*\.amazonaws\.com:443' "$p/proxy-plan.log"
 check "pass: made-up credentials end the pass" grep -qx 'plan: plan pass ended: credentials' "$p/plan-pass.txt"
@@ -120,7 +163,19 @@ check "pass: only the code-error was prepared at the base" test "$(grep -c ' at 
 check "pass: the code-error was initialised at the base" grep -qx 'init: examples/broken at base: code-error' "$p/plan-pass-init.txt"
 check "pass: the deferred base line was filled in" grep -qx 'base: reproduces at base' "$p/plan-pass.txt"
 check "pass: no deferred base line is left" test -z "$(grep -x 'base: deferred' "$p/plan-pass.txt")"
-check "pass: init reached no AWS endpoint" test -z "$(grep 'amazonaws' "$p/proxy-init.log")"
+# The init-phase network check asks the init proxy for STS on purpose, to see it refused. So
+# what must hold is that no AWS endpoint was reached: tinyproxy wrote no "Established
+# connection" line for an amazonaws host, and every request for one has its own "Proxying
+# refused on filtered url" line, the same targets the same number of times.
+no_aws_reached() { # proxy log
+  local log
+  log="$(tr 'A-Z' 'a-z' < "$1")" || return 1
+  ! printf '%s\n' "$log" | grep -q 'established connection to host "[^"]*amazonaws' || return 1
+  [ "$(printf '%s\n' "$log" | sed -nE 's/.*request \(file descriptor [0-9]+\): [a-z]+ ([^ ]*amazonaws[^ ]*) http.*/\1/p' | sort)" = \
+    "$(printf '%s\n' "$log" | sed -nE 's/.*proxying refused on filtered url "([^"]*amazonaws[^"]*)".*/\1/p' | sort)" ]
+}
+check "pass: init reached no AWS endpoint" no_aws_reached "$p/proxy-init.log"
+check "pass: the init proxy refused the network check's STS request" grep -q 'Proxying refused on filtered url "sts.us-east-1.amazonaws.com:443"' "$p/proxy-init.log"
 check "pass: no credential value in the record" test -z "$(grep -rl 'smoke-test-not-a-' "$p")"
 check "pass: a plan container was inspected with the credentials file mounted" grep -q '/opt/plan-pass/creds.env' "$rec/inspect.json"
 check "pass: no credential value in a plan container's configuration" test -z "$(grep 'smoke-test-not-a-' "$rec/inspect.json")"
@@ -138,6 +193,31 @@ check "loader: a value keeps its trailing pad and internal '='" test "$loaded" =
   PLAN_PASS_AWS_ACCESS_KEY_ID=smoke-key PLAN_PASS_AWS_SECRET_ACCESS_KEY=smoke=sec=ret PLAN_PASS_AWS_SESSION_TOKEN=smoke-token=)"
 check "pass: the record holds regular files only" test -z "$(find "$p" -mindepth 1 ! -type f -print -quit)"
 check "pass: nothing is left under --tmp" test -z "$(find "$rec/pass-tmp" -mindepth 1 -print -quit)"
+# The network check fails closed: IPv6 on for a run network, or an open path, stops the run
+# before any head code runs and before the first session, with no plan recorded; a plan-phase
+# control that fails stops it after init, before the first plan container.
+for m in ipv6 open-path plan-control; do
+  echo "$m" > "$rec/shim-mode"
+  PATH="$rec/shim:$PATH" "$here/run-pass.sh" --clone "$repo" --record "$rec/net-$m" --tmp "$rec/pass-tmp" \
+    --credentials-env-file "$creds" examples/sts > /dev/null 2> "$rec/net-$m.err"
+  echo $? > "$rec/net-$m.rc"
+done
+rm -f "$rec/shim-mode"
+check "network: IPv6 on stops the run" test "$(cat "$rec/net-ipv6.rc")" -eq 2
+check "network: the IPv6 refusal says why" grep -qx 'run-pass: refusing to plan: IPv6 is on for a run network' "$rec/net-ipv6.err"
+check "network: IPv6 on runs no probe and no plan" test ! -e "$rec/net-ipv6/network-check-init.txt" -a ! -e "$rec/net-ipv6/plan-pass.txt"
+check "network: an open path stops the run" test "$(cat "$rec/net-open-path.rc")" -eq 2
+check "network: the refusal says why" grep -qx 'run-pass: refusing to plan: the network check found an open path, or could not run' "$rec/net-open-path.err"
+check "network: the probe names the open path" grep -qx 'open direct proxy:8888' "$rec/net-open-path/network-check-init.txt"
+check "network: an open path runs no head code" test ! -e "$rec/net-open-path/plan-pass-init.txt"
+check "network: an open path runs no plan container and records no plan" test ! -e "$rec/net-open-path/proxy-plan.log" -a ! -e "$rec/net-open-path/plan-pass.txt"
+q="$rec/net-plan-control"
+check "network: a failed plan-phase control stops the run" test "$(cat "$q.rc")" -eq 2
+check "network: the plan-phase refusal says why" grep -qx 'run-pass: refusing to plan: the network check found an open path, or could not run' "$q.err"
+check "network: the plan-phase probe names the failed control" grep -qx 'fail control proxy CONNECT example.com:443: refused' "$q/network-check-plan.txt"
+check "network: the init phase ran before it" grep -qx 'init: examples/sts: ready' "$q/plan-pass-init.txt"
+check "network: a failed plan-phase control records no plan" test ! -e "$q/plan-pass.txt"
+
 # --tmp is where the private temporary directory goes: one that cannot be written to stops
 # the run before any credential is read or any Docker object is made.
 mkdir -m 0500 "$rec/ro-tmp"
@@ -207,8 +287,9 @@ leftover() { # ids...: prints each of those runs' containers, networks and volum
   done
   return 0
 }
-ids="$(cat "$r/run-id.txt" "$a/run-id.txt" "$rec/static/run-id.txt" "$p/run-id.txt" 2>/dev/null)"
-check "every run recorded its id" test "$(printf '%s\n' "$ids" | grep -c .)" -eq 4
+ids="$(cat "$r/run-id.txt" "$a/run-id.txt" "$rec/static/run-id.txt" "$p/run-id.txt" \
+  "$rec/net-ipv6/run-id.txt" "$rec/net-open-path/run-id.txt" "$rec/net-plan-control/run-id.txt" 2>/dev/null)"
+check "every run recorded its id" test "$(printf '%s\n' "$ids" | grep -c .)" -eq 7
 # shellcheck disable=SC2086 # one id per word
 check "no container, network or volume of these runs left behind" test -z "$(leftover $ids)"
 

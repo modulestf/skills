@@ -46,7 +46,8 @@
         "ecr:GetAuthorizationToken", "ecr:GetDownloadUrlForLayer",
         "lambda:GetFunctionConfiguration", "ecs:DescribeTaskDefinition",
         "ec2:DescribeLaunchTemplateVersions", "ec2:DescribeInstanceAttribute",
-        "cloudfront:GetFunction", "iam:GetAccountAuthorizationDetails"
+        "cloudfront:GetFunction", "iam:GetAccountAuthorizationDetails",
+        "lambda:ListFunctions", "lambda:ListVersionsByFunction"
       ],
       "Resource": "*"
     }

@@ -19,6 +19,12 @@
 # its origin remote, so the plan pass can fetch --base for a re-run. The record directory must
 # not exist yet; it is created 0700 and ends up holding regular files only.
 #
+# Before anything else runs in a container, a network check: IPv6 must be off on both run
+# networks, and egress-probe.sh check, in a container on the internal network with no
+# credentials, must find every path out closed behind the init proxy; and before the first
+# plan container, behind the plan proxy too. Any failure stops the run with a fixed reason,
+# before the first session and with no plan recorded.
+#
 # Phases: the init phase runs in one container behind the init proxy (registry and download
 # hosts), with no credentials. The plan phase runs one container per example behind the plan
 # proxy (AWS service endpoints), with the work volume read-only, and is the only place the
@@ -165,8 +171,8 @@ fi
 load_creds='while IFS= read -r l; do k=${l%%=*}; v=${l#*=}; case $k in PLAN_PASS_AWS_ACCESS_KEY_ID|PLAN_PASS_AWS_SECRET_ACCESS_KEY|PLAN_PASS_AWS_SESSION_TOKEN) export "$k=$v" ;; esac; done < /opt/plan-pass/creds.env' # creds-loader
 
 docker volume create "$volume" > /dev/null
-docker network create --internal "$net_int" > /dev/null
-docker network create "$net_ext" > /dev/null
+docker network create --internal --ipv6=false "$net_int" > /dev/null
+docker network create --ipv6=false "$net_ext" > /dev/null
 
 hardening=(--read-only --cap-drop ALL --security-opt no-new-privileges --pids-limit 512)
 proxy_env=(-e HTTPS_PROXY=http://proxy:8888 -e HTTP_PROXY=http://proxy:8888
@@ -186,6 +192,47 @@ in_runner() { # stdout file, then docker run arguments
     head -c "$max_bytes" >> "$outf" || true
 }
 
+# The pre-session network check, on a laptop too, before any head code runs and before the
+# first session (docs/isolated-runner.md, Validation). It fails closed: IPv6 on for either run
+# network, or any fault the probe finds, stops the run, with no session issued and no plan
+# recorded. The probe runs in a runner container attached as a plan container is, with no
+# credentials, once behind the init proxy here and once behind the plan proxy before the first
+# plan container, and is passed the host addresses it cannot know: the internal network's
+# gateway, the docker0 address, and the host's IPv6 addresses. Its lines, which name those
+# addresses, stay in network-check-<phase>.txt in the record and are never reduced or uploaded.
+[ "$(docker network inspect -f '{{.EnableIPv6}}' "$net_int" "$net_ext" | tr '\n' ' ')" = "false false " ] ||
+  die "refusing to plan: IPv6 is on for a run network"
+v4_re='^[0-9]{1,3}([.][0-9]{1,3}){3}$'
+gw="$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' "$net_int")"
+[[ "$gw" =~ $v4_re ]] || die "refusing to plan: the internal network has no IPv4 gateway address"
+probe_args=(--gateway "$gw")
+d0="$(docker network inspect -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' bridge 2> /dev/null || true)"
+[[ ! "$d0" =~ $v4_re ]] || probe_args+=(--host "$d0")
+if command -v ip > /dev/null 2>&1; then
+  br="br-$(docker network inspect -f '{{.Id}}' "$net_int" | cut -c1-12)"
+  # Global addresses on any interface, and the internal bridge's link-local one, which is on
+  # the container's own link. More than 16, or one in another form, stops the run: none is
+  # dropped unprobed.
+  v6="$({ ip -6 -o addr show scope global 2> /dev/null | awk '{ split($4, a, "/"); print a[1] }'
+    ip -6 -o addr show dev "$br" scope link 2> /dev/null | awk '{ split($4, a, "/"); print a[1] "%eth0" }'; } || true)"
+  [ "$(printf '%s\n' "$v6" | grep -c .)" -le 16 ] || die "refusing to plan: more than 16 host IPv6 addresses to probe"
+  for a in $v6; do
+    [[ "$a" =~ ^[0-9a-f:]+(%eth0)?$ ]] || die "refusing to plan: a host IPv6 address the probe cannot take"
+    probe_args+=(--host "$a")
+  done
+fi
+network_check() { # phase, then egress-probe.sh check arguments beyond the host addresses
+  local f="$record/network-check-$1.txt"; shift
+  docker rm -f "$runner" > /dev/null 2>&1 || true
+  docker run --rm --name "$runner" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
+    --entrypoint /usr/local/bin/egress-probe "$runner_image" check "${probe_args[@]}" "$@" \
+    > "$f" 2>> "$record/runner.log" &&
+    [ -s "$f" ] && [ "$(tail -n 1 "$f")" = "end network check" ] ||
+    die "refusing to plan: the network check found an open path, or could not run"
+}
+start_proxy "$proxy_init" init.conf
+network_check init --allowed registry.terraform.io --refused sts.us-east-1.amazonaws.com
+
 # Prepare: copy the read-only clone into the run directory. No network.
 in_runner "$record/runner.log" --network none "${common[@]}" -v "$clone":/src:ro -v "$volume":/work \
   --entrypoint /bin/bash "$runner_image" -c "mkdir -m 700 '$RUN' && cp -a /src '$RUN/clone'"
@@ -196,8 +243,8 @@ t0=$SECONDS
 # starts with a budget of 0 or less
 left() { echo $((budget - (SECONDS - t0))); }
 
-# Init phase: G0, gates and init for every example. No credentials.
-start_proxy "$proxy_init" init.conf
+# Init phase: G0, gates and init for every example. No credentials. The init proxy is the
+# one the network check started.
 in_runner "$record/plan-pass-init.txt" --network "$net_int" "${common[@]}" "${proxy_env[@]}" \
   -v "$volume":/work --entrypoint /bin/bash "$runner_image" -c \
   "bash /opt/plan-pass/plan-pass.sh g0 '$RUN' && exec bash /opt/plan-pass/plan-pass.sh plan '$RUN' '$pname' --mode runner --budget '$budget' --phase init \"\$@\"" \
@@ -232,6 +279,7 @@ host_only='^(plan summary:|plan pass mode:|plan pass budget:|host example )'
 # Plan phase: one container per example. Each block is kept apart until the end, because a
 # deferred merge base re-run fills in its base line later.
 start_proxy "$proxy_plan" plan.conf
+network_check plan --allowed sts.us-east-1.amazonaws.com --refused registry.terraform.io
 n=0 planned=0 exc=0 deferred=() examples=("$@")
 for ex in "$@"; do
   n=$((n + 1)); blk="$TMPRUN/block.$n"

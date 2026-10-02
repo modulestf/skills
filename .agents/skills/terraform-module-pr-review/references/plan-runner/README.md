@@ -7,8 +7,10 @@ runtime and no AWS infrastructure. `run-pass.sh` runs the whole plan pass,
 [plan-pass.sh](../plan-pass.sh) in runner mode, there for a list of examples; `run-plan.sh`
 runs a bare `init` and `plan` for one example, for the smoke test. The pull request skill's
 plan pass calls `run-pass.sh` when a container runtime is available, and runs the laptop pass
-otherwise ([Runner or laptop](../plan-pass.md#runner-or-laptop)). The GitHub Actions review
-workflow calls neither.
+otherwise ([Runner or laptop](../plan-pass.md#runner-or-laptop)). The hosted review workflow's
+plan job runs `run-pass.sh` on a GitHub-hosted runner for a maintainer's `@pofix plan` request,
+and `hosted-record.sh` reduces its record to `plan-hosted.json`, classes and counts only
+([Hosted runner](../plan-pass.md#hosted-runner)). Nothing calls `run-plan.sh` but the smoke test.
 
 ## Stated limits
 
@@ -37,6 +39,26 @@ workflow calls neither.
   service endpoints only, not hosts customers control, but a path-style S3 request
   (`s3.<region>.amazonaws.com/<bucket>`) can reach a bucket someone else owns, signed or,
   for a publicly writable bucket, unsigned.
+- **The network check before the first session proves only the paths it probes.** It runs
+  behind the init proxy before any head code, and behind the plan proxy before the first plan
+  container. It refuses to plan when IPv6 is on for either run network, when more than 16
+  host IPv6 addresses would need probing, and when a container on the internal network
+  connects to the internal gateway, the `docker0` address, a host IPv6 address or a metadata
+  address (`169.254.169.254`, `fd00:ec2::254`) on ports 22, 80, 443, 2375, 2376 or 8888,
+  connects out directly, resolves an outside name, has a default route or a second interface
+  up, or gets an IP-literal `CONNECT`, or one to a host outside that proxy's allowlist,
+  through the proxy. Two positive controls must hold, or a closed result could be a tool that
+  never ran: a direct connection to the proxy on 8888, and a `CONNECT` the proxy passes, to
+  the registry behind the init proxy and to STS behind the plan proxy. So an offline host
+  cannot plan. A missing tool, a tool exiting 126 or 127, and a `CONNECT` the proxy did not
+  refuse itself (curl exit 56 with a 4xx or 5xx answer) are faults, never closed paths, and
+  the probe's output must end with its `end network check` line. A service on another port of a host
+  address is not probed; the host's INPUT drops on `br-+` and `docker0` are what close those.
+  The probe runs on a laptop too: on a Linux host with a service listening on the bridge
+  address on one of those ports, the runner refuses until such drops are in place. The host
+  addresses come from `docker network inspect` and, where `ip` exists, from the host's own
+  IPv6 addresses; on Docker Desktop the host's own interfaces are inside its VM and only the
+  Docker addresses are probed.
 - **Only the request target is filtered.** Traffic inside an allowed `CONNECT` tunnel is
   not inspected.
 - **A `CONNECT` to a port other than 443 leaves no refusal line.** tinyproxy refuses it
@@ -99,8 +121,9 @@ workflow calls neither.
 | `allowlist-init` | Init phase: `registry.terraform.io`, `releases.hashicorp.com`, `github.com`, `codeload.github.com`, `objects.githubusercontent.com`. No AWS |
 | `allowlist-plan` | Plan phase: named AWS service endpoints, in their global and regional forms, and nothing else. A host a legitimate example needs shows in `plan-refused-hosts.txt`, and its service is added here; `kinesis` came from the lambda event source mapping example. EC2 public DNS names, load balancer and API Gateway hosts, S3 website hosts and S3 bucket virtual hosts do not match |
 | `entry.sh` | Runner entrypoint, one phase per container: `init` copies the read-only clone to `/work` and runs `init` with no credentials; `plan` runs `plan` in the same copy |
-| `egress-probe.sh` | Smoke-test probe run inside the runner after a phase: direct connections, name resolution, plain HTTP, and one line per host through the proxy |
-| `run-pass.sh` | Host side of the plan pass: exports the credentials, copies the clone into the work volume, runs the init phase in one container and the plan phase in one container per example, each behind its own proxy, and writes the record |
+| `egress-probe.sh` | Probe run inside the runner on the internal network. `init` and `plan`, for the smoke test after a phase: direct connections, name resolution, plain HTTP, and one line per host through the proxy, always exiting 0. `check`, for `run-pass.sh` behind each proxy before its first session: fails closed, exiting 1 on any open path or fault, from two positive controls, the interfaces and routes, name resolution, refused `CONNECT`s and direct connections to the host addresses it is passed |
+| `run-pass.sh` | Host side of the plan pass: checks the run networks with `egress-probe.sh check`, copies the clone into the work volume, runs the init phase in one container and the plan phase in one container per example, each behind its own proxy, issues each plan container its session, and writes the record |
+| `hosted-record.sh` | Reduces a finished `run-pass.sh` record to `plan-hosted.json` for a hosted run: per example the class at the head and the base and the `Plan:` counts, and the number of refused hosts, refusing any record it cannot read that way ([Hosted runner](../plan-pass.md#hosted-runner)) |
 | `record-scan.sh` | Host-side leak scan over a finished record: exact values and the plan pass's evidence patterns, each matching line replaced by a marker |
 | `image-tag.sh` | Prints the image tag: `PLAN_RUNNER_TAG`, or one derived from the files the images are built from |
 | `run-plan.sh` | Host side of the bare runner: builds or reuses the images, creates the networks and the work volume, runs the two phases each behind its own proxy, exports the record as regular files only and removes everything |
@@ -162,6 +185,15 @@ passes a snapshot of its clone taken before its default pass writes `.terraform/
 files, which G0 would refuse ([plan-pass.md](../plan-pass.md#runner-or-laptop)). This is
 the skill's plan pass whenever a container runtime is available.
 
+- **Network check:** before anything else runs in a container, IPv6 must be off on both run
+  networks, and `egress-probe.sh check`, run in a container attached to the internal network
+  as a plan container is, with no credentials and behind the init proxy, must find every path
+  closed and both positive controls holding. The same check runs behind the plan proxy before
+  the first plan container. The host passes it the internal network's gateway, the `docker0` address and the
+  host's IPv6 addresses, which the container cannot know. A failure stops the run with a fixed
+  reason on standard error, `refusing to plan: ...`, before any head code runs and before the
+  first session, and the record holds no `plan-pass.txt`. The probe's lines are in
+  `network-check-init.txt` and `network-check-plan.txt`. It runs on every run, on a laptop too.
 - **Prepare:** a container with no network copies the read-only clone into the run
   directory, `/work/pr-review.XXXXXX`, inside the work volume.
 - **Init phase:** one container behind the init proxy, with no credentials. It runs
@@ -239,6 +271,11 @@ The record directory must not exist yet, and receives regular files only:
 - `plan-pass-init.txt`: the G0 count, one `init:` line per example, and one per merge base
   re-run;
 - `proxy-init.log`, `proxy-plan.log` and `plan-refused-hosts.txt`, as for `run-plan.sh`;
+- `network-check-init.txt` and `network-check-plan.txt`: the network check's lines behind
+  each proxy, `closed <check>` and `ok <check>` for a pass, anything else for a fault, and the
+  `end network check` line. They name the host's gateway, `docker0` and IPv6 addresses, so
+  they stay in the record on the runner: `hosted-record.sh` never reads them, and nothing
+  uploads them;
 - `runner.log`: the containers' error output;
 - `run-id.txt`: the id every Docker object of the run carries.
 
@@ -290,7 +327,9 @@ third whose `init` fails the same way at the head and at the base, a `code-error
 needs no credentials; the fixture is its own `origin`. Ten more copies of that example make
 thirteen, one past the laptop's cap. The made-up credentials fail the plan pass's `sts`
 check, so that pass ends at credentials after the init phase. It also runs
-`record-scan.sh` on a crafted record. Its 60 checks cover:
+`record-scan.sh` on a crafted record, and `run-pass.sh` three more times with a Docker wrapper
+that fakes a fault for the network check: IPv6 on, the probe's gateway pointed at the proxy,
+which listens, and a plan-phase positive control its proxy refuses. Its checks cover:
 
 - each phase reaches only its own hosts;
 - during plan, the registry, GitHub, an EC2 public DNS name and S3 bucket hosts are refused;
@@ -304,6 +343,12 @@ check, so that pass ends at credentials after the init phase. It also runs
   phase checks the credentials through the plan proxy, the host heads each block, the
   summary line is written, and no credential value and nothing but regular files is in the
   record;
+- `run-pass.sh`'s network check behind each proxy: every line closed or a control that held,
+  one interface up, no default route, the IP-literal `CONNECT` and the other phase's host
+  refused, this phase's host passed, outside names unresolved, the gateway, `docker0` and
+  metadata addresses closed on six ports each; IPv6 on stops the run before the probe, an open
+  path stops it with the path named before any head code, and a failed plan-phase control
+  stops it after init, before any plan container or plan record;
 - the runner's budget line is recorded, and all thirteen examples are initialised, with no
   cap;
 - the merge base: only the `code-error` is initialised there, and its `base: deferred` line

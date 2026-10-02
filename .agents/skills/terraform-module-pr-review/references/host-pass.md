@@ -23,9 +23,30 @@ A line in any other form, or a path that is not absolute or holds a backtick, na
 bash <skill>/references/host-pass.sh check <directory> --head <head commit the task states>
 ```
 
-`check` prints `records accepted` only when the directory holds exactly `files.json`, `host.json` and `task.md`, and optionally `verify.json`, all regular files within their caps, `host.json` with exactly the keys and values the script writes and its `head_sha` equal to `--head`, `files.json` a list of file objects, and `task.md` with that head revision line, exactly one untrusted block and, when the host wrote them, the four lines of [Incremental Review](#incremental-review) in order. Otherwise it prints `records rejected: <reason>`. A rejection stops the run: it says the host records were rejected and why, and renders nothing, since the change itself is in the records. A head that moved after the request is rejected the same way.
+`check` prints `records accepted` only when the directory holds exactly `files.json`, `host.json` and `task.md`, and optionally `verify.json` and `plan-hosted.json`, all regular files within their caps, `host.json` with exactly the keys and values the script writes and its `head_sha` equal to `--head`, `files.json` a list of file objects, and `task.md` with that head revision line, exactly one untrusted block and, when the host wrote them, the four lines of [Incremental Review](#incremental-review) in order. When `plan-hosted.json` is present, it must also pass the rules in [Plan Record](#plan-record). Otherwise it prints `records rejected: <reason>`. A rejection stops the run: it says the host records were rejected and why, and renders nothing, since the change itself is in the records. A head that moved after the request is rejected the same way.
 
 On acceptance, `headRefOid` is `head_sha`, and the target is `repo` and `number` from `host.json`, which must equal the pull request the request names; a mismatch stops the run.
+
+## Plan Record
+
+`plan-hosted.json` is the hosted plan job's record, described in [plan-pass.md](plan-pass.md#hosted-runner). It is accepted only when all of these hold, and otherwise refused with the reason in brackets:
+
+- a regular file, not a symbolic link, within 1 MiB;
+- one JSON object with exactly the keys and value types plan-pass.md gives, every class from its lists, and plan counts on `planned` only (`plan record content`);
+- `host.json`'s `prefix` is empty (`plan record prefix`): the plan record's paths assume an empty module root prefix, as the verify job does;
+- `head` equals `--head` (`plan record head`);
+- `merge_base` equals `host.json`'s `merge_base`, which must not be null (`plan record merge base`);
+- examples the runner plans for this change, each once (`plan record examples`): every path is `examples/<name>`, no path appears twice, and unless `files.json` lists a `.tf` file outside `examples/`, every path is an example directory a listed file, or its previous name, lies in.
+
+The example rule is a consistency check, not a security boundary: a `.tf` file outside `examples/` in the change widens it to every `examples/<name>`, and the plan job's own example list, not this check, decides what is planned.
+
+The plan job finishes up to 105 minutes before the review reads the pull request, and the base branch can move in that time. The review's merge base or `files.json` then differs from the plan's, and a plan record inside the records directory would reject the whole directory. So the review job checks the file first, on its own, against the records it wrote:
+
+```
+bash <skill>/references/host-pass.sh check-plan <file> <records directory> --head <head commit>
+```
+
+`check-plan` reads `host.json` and `files.json` from the records directory, checks them as `check` does, and applies the rules above. It prints `plan accepted` and exits 0, or `plan rejected: <reason>` and exits 1; exit 2 is a usage error. Besides the reasons above it can refuse with `records not a directory`, `records not a regular file`, `records over the size cap`, `records files list` or `records content`. Only an accepted file is copied into the records directory. A refused one is dropped, the task says the plan record was refused, and the records go through `check` without it. `check` still refuses a bad `plan-hosted.json` inside the records, which can only be there when a host skipped `check-plan`.
 
 ## What the Records Replace
 
@@ -77,7 +98,7 @@ bash <skill>/references/verify-pass.sh check "$RUN" --files <directory>/files.js
   --base <merge_base> --head <head_sha> --results <directory>/verify.json --prefix <prefix>
 ```
 
-with `merge_base` and `prefix` from `host.json`. A `merge_base` of null cannot be checked: every example directory the change touches is recorded as not run with `host results rejected: base_sha`. Without `verify.json`, verification did not run on the host, and every example directory is recorded as `host verification did not run`. Each of those is a check that could not run, as [verify-pass.md](verify-pass.md#results-from-a-host) says. The record lines are rendered from the accepted `dirs` in the words [verify-pass.md](verify-pass.md#output) gives.
+with `merge_base` and `prefix` from `host.json`. A `merge_base` of null cannot be checked: every example directory the change touches is recorded as not run with `host results rejected: base_sha`. When the records directory holds `plan-hosted.json`, the plan pass's record is rendered from it, as [plan-pass.md](plan-pass.md#hosted-runner) says; without it, the task's own text gives the reason there is no plan, and no profile is asked for. Without `verify.json`, verification did not run on the host, and every example directory is recorded as `host verification did not run`. Each of those is a check that could not run, as [verify-pass.md](verify-pass.md#results-from-a-host) says. The record lines are rendered from the accepted `dirs` in the words [verify-pass.md](verify-pass.md#output) gives.
 
 ## Handover
 
