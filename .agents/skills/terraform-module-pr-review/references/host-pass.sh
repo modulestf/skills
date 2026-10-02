@@ -556,6 +556,19 @@ check_records() { # dir, head -> prints the verdict, returns 0 when accepted
   RJ -e --arg head "$head" 'include "host-records"; valid_host($head)' "$dir/host.json" > /dev/null 2>&1 ||
     { reject "unexpected content"; return 1; }
   grep -qxF "Head revision: $head" "$dir/task.md" || { reject "head revision"; return 1; }
+  # The incremental lines, when present: four lines in order right after the head revision.
+  local n
+  n="$(grep -cE '^(Change|Previous review|Carried findings|Scope): ' "$dir/task.md")"
+  if [ "$n" != 0 ]; then
+    [ "$n" = 4 ] && awk -v h="Head revision: $head" '
+      $0 == h { want = 1; next }
+      want == 1 { if ($0 !~ /^Change: [0-9a-f]{40}\.\.\.[0-9a-f]{40}$/) exit 1; want = 2; next }
+      want == 2 { if ($0 !~ /^Previous review: [0-9a-f]{40} [0-9a-f]{40}$/) exit 1; want = 3; next }
+      want == 3 { if ($0 !~ /^Carried findings: \/[A-Za-z0-9._\/-]+\/carried-task\.json$/) exit 1; want = 4; next }
+      want == 4 { if ($0 !~ /^Scope: \/[A-Za-z0-9._\/-]+\/scope-task\.json$/) exit 1; want = 5; next }
+      END { if (want != 5) exit 1 }' "$dir/task.md" &&
+      grep -qE "^Change: [0-9a-f]{40}\.\.\.$head\$" "$dir/task.md" || { reject "incremental lines"; return 1; }
+  fi
   s="$(sed -n 's/^UNTRUSTED-\([0-9a-f]\{12\}\) BEGIN$/\1/p' "$dir/task.md" | head -n 1)"
   [ -n "$s" ] && [ "$(grep -cxF "UNTRUSTED-$s BEGIN" "$dir/task.md")" = 1 ] &&
     [ "$(grep -cxF "UNTRUSTED-$s END" "$dir/task.md")" = 1 ] &&
@@ -563,9 +576,362 @@ check_records() { # dir, head -> prints the verdict, returns 0 when accepted
   echo "records accepted"
 }
 
+# --- Incremental review: prior, check-prior, record and accept (host-pass.md, Incremental
+# Review). The pure rules are in incremental.jq.
+
+IJ() { jq -L "$HERE" "$@"; } # jq with incremental.jq on the module path
+MAX_COMMITS=50
+MAX_RUN_PAGES=20
+MAX_SCOPE=50
+MAX_DEPTH=5
+MAX_AGE=604800 # 7 days
+TEXT_CAP=65535
+token_re='^[A-Za-z0-9._-]{1,64}$'
+ref_re='^[A-Za-z0-9._/-]{1,255}$'
+
+carry_map() { # rule-facts.md -> {"<rule_id>": "file"|"never"} on stdout
+  grep -E '^\| `[a-z]+\.[a-z0-9-]+` \|.*\| (file|never) \|$' "$1" |
+    sed -E 's/^\| `([a-z]+\.[a-z0-9-]+)` \|.*\| (file|never) \|$/\1 \2/' |
+    jq -R -s 'split("\n") | map(select(. != "") | split(" ") | {(.[0]): .[1]}) | add // {}'
+}
+
+# The findings JSON, canonical and compact, gzip -n, base64. Deterministic for one input.
+pack() { jq -S -c . "$1" | gzip -n -c | openssl base64; }
+
+cmd_prior() {
+  local repo="" pr="" head="" base_ref="" mb="" prefix="" skills="" facts="" verify="" app="" rules="" now="" out="" force=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2-}"; shift 2 || die "--repo needs a value" ;;
+      --pr) pr="${2-}"; shift 2 || die "--pr needs a value" ;;
+      --head) head="${2-}"; shift 2 || die "--head needs a value" ;;
+      --base-ref) base_ref="${2-}"; shift 2 || die "--base-ref needs a value" ;;
+      --merge-base) mb="${2-}"; shift 2 || die "--merge-base needs a value" ;;
+      --prefix) prefix="${2-}"; shift 2 || die "--prefix needs a value" ;;
+      --skills) skills="${2-}"; shift 2 || die "--skills needs a value" ;;
+      --facts) facts="${2-}"; shift 2 || die "--facts needs a value" ;;
+      --verify) verify="${2-}"; shift 2 || die "--verify needs a value" ;;
+      --app-id) app="${2-}"; shift 2 || die "--app-id needs a value" ;;
+      --rules) rules="${2-}"; shift 2 || die "--rules needs a value" ;;
+      --now) now="${2-}"; shift 2 || die "--now needs a value" ;;
+      --force-full) force="${2-}"; shift 2 || die "--force-full needs a value" ;;
+      --out) out="${2-}"; shift 2 || die "--out needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  [[ "$repo" =~ $repo_re ]] || die "--repo must be owner/name"
+  [[ "$pr" =~ ^[1-9][0-9]{0,9}$ ]] || die "--pr must be a pull request number"
+  [[ "$head" =~ $sha_re ]] || die "--head must be a 40 character SHA"
+  [[ "$base_ref" =~ $ref_re ]] || die "--base-ref must be a branch name"
+  [[ "$mb" =~ $sha_re ]] || die "--merge-base must be a 40 character SHA"
+  [[ -z "$prefix" || "$prefix" =~ ^[A-Za-z0-9._/-]{1,255}$ ]] || die "--prefix must be a path"
+  [[ "$skills" =~ $sha_re ]] || die "--skills must be a 40 character SHA"
+  [[ "$facts" =~ ^([0-9a-f]{64}|none)$ ]] || die "--facts must be a SHA-256 or none"
+  [[ "$verify" =~ $token_re ]] || die "--verify must be a token"
+  [[ "$app" =~ ^[1-9][0-9]{0,15}$ ]] || die "--app-id must be a number"
+  [[ "$now" =~ ^[1-9][0-9]{8,11}$ ]] || die "--now must be a Unix time"
+  [[ -z "$force" || "$force" =~ ^[a-z-]{1,40}$ ]] || die "--force-full must be a reason code"
+  [ -f "$rules" ] && [ ! -L "$rules" ] || die "--rules must be the rule facts file"
+  case "$out" in /?*) ;; *) die "--out must be an absolute path" ;; esac
+  [ ! -e "$out" ] && [ ! -L "$out" ] || die "the output directory already exists"
+
+  local w stage
+  w="$(mktemp -d "${TMPDIR:-/tmp}/host-pass.XXXXXX")" || die "no work directory"
+  # shellcheck disable=SC2064 # the path is fixed now
+  trap "rm -rf '$w'" EXIT
+  stage="$w/out"; mkdir "$stage"
+  local commits=0 pages=0 num=0 den=0 old="" text="" depth=0 last_full=""
+  last_full="$(jq -rn --argjson t "$now" '$t | todate')"
+  full() { # reason
+    jq -n --arg reason "$1" --arg head "$head" --arg old "$old" --arg lf "$last_full" \
+      --argjson c "$commits" --argjson p "$pages" --argjson n "$num" --argjson d "$den" '
+      {format: 1, mode: "full", reason: $reason, head: $head,
+       previous_head: (if $old == "" then null else $old end), previous_merge_base: null,
+       depth: 0, last_full: $lf, scope: [],
+       metrics: {commits: $c, pages: $p, changed_since: $n, changed_total: $d}}' > "$stage/meta.json"
+    echo '[]' > "$stage/carried.json"; echo '[]' > "$stage/carried-task.json"; echo '[]' > "$stage/scope-task.json"
+    mv "$stage" "$out" || die "cannot create the output directory"
+    echo "prior: full review, reason $1"
+    exit 0
+  }
+  [ -z "$force" ] || full "$force"
+  # A rule facts file with no carry column carries nothing: the review is full.
+  carry_map "$rules" > "$w/carry.json" 2> /dev/null && jq -e 'type == "object" and length > 0' "$w/carry.json" > /dev/null 2>&1 ||
+    full no-carry-column
+
+  # The newest record: walk the pull request's commits newest first.
+  read_twice "$w/commits" --paginate "repos/$repo/pulls/$pr/commits?per_page=100" --jq '.[].sha' || full read-failed
+  grep -qE '^[0-9a-f]{40}$' "$w/commits" || full read-failed
+  local sha found=""
+  while IFS= read -r sha; do
+    [[ "$sha" =~ $sha_re ]] || full read-failed
+    commits=$((commits + 1))
+    [ "$commits" -le "$MAX_COMMITS" ] || full commit-cap
+    read_twice "$w/runs" --paginate "repos/$repo/commits/$sha/check-runs?check_name=pofix%20review&filter=all&per_page=100" \
+      --jq '{page: 1, runs: [.check_runs[] | {id, name, app_id: .app.id, status, head_sha, text: (.output.text // "")}]}' ||
+      full read-failed
+    # The page cap is per commit; the total is reported.
+    [ "$(grep -c '"page":1' "$w/runs")" -le "$MAX_RUN_PAGES" ] || full page-cap
+    pages=$((pages + $(grep -c '"page":1' "$w/runs")))
+    jq -s --argjson app "$app" '[.[].runs[] | select(.name == "pofix review" and .app_id == $app
+        and .status == "completed" and (.text | startswith("pofix-record ")))] | max_by(.id) // empty' \
+      "$w/runs" > "$w/cand" 2> /dev/null || full read-failed
+    if [ -s "$w/cand" ]; then found="$sha"; break; fi
+  done < <(tail -r "$w/commits" 2> /dev/null || tac "$w/commits")
+  [ -n "$found" ] || full none-found
+  old="$found"
+  # The record: the header, then the findings, each checked; any failure is a full review.
+  jq -e --arg sha "$old" '.head_sha == $sha' "$w/cand" > /dev/null || full invalid-record
+  jq -r '.text' "$w/cand" > "$w/text"
+  [ "$(wc -c < "$w/text")" -le "$TEXT_CAP" ] || full invalid-record
+  IJ -R -s -e --arg repo "$repo" --arg pr "$pr" --arg old "$old" 'include "incremental";
+    (split("\n")[0] | header) as $h
+    | $h.repo == $repo and $h.pr == $pr and $h.head == $old' "$w/text" > "$w/hdr" 2> /dev/null || full invalid-record
+  IJ -R -s 'include "incremental"; split("\n")[0] | header' "$w/text" > "$w/h.json" 2> /dev/null || full invalid-record
+  hv() { jq -r --arg k "$1" '.[$k]' "$w/h.json"; }
+  [ "$old" != "$head" ] || full same-head
+  [ "$(hv base_ref)" = "$base_ref" ] || full base-ref-changed
+  [ "$(hv merge_base)" = "$mb" ] || full merge-base-moved
+  [ "$(hv skills)" = "$skills" ] || full skills-changed
+  [ "$(hv facts)" = "$facts" ] || full facts-changed
+  [ "$(hv verify)" = "$verify" ] || full verify-changed
+  depth="$(hv depth)"
+  [ "$depth" -lt "$MAX_DEPTH" ] || full depth-cap
+  last_full="$(hv last_full)"
+  local lf
+  lf="$(jq -rn --arg t "$last_full" '$t | fromdate' 2> /dev/null)" && [[ "$lf" =~ ^[0-9]+$ ]] || full invalid-record
+  [ "$lf" -le "$now" ] && [ $((now - lf)) -le "$MAX_AGE" ] || full age-cap
+  awk '/^```$/ { f = !f; next } f' "$w/text" | openssl base64 -d 2> /dev/null | gzip -d -c 2> /dev/null |
+    head -c $((CAP + 1)) > "$w/found.json"
+  [ -s "$w/found.json" ] && [ "$(wc -c < "$w/found.json")" -le "$CAP" ] || full invalid-record
+  [ "$(jq -S -c . "$w/found.json" 2> /dev/null | openssl dgst -sha256 -r | cut -d' ' -f1)" = "$(hv sha256)" ] || full invalid-record
+  IJ -e 'include "incremental"; findings_list(true)' "$w/found.json" > /dev/null 2>&1 || full invalid-record
+
+  # Ancestry and the touched set, from the compare of the previous head to this one.
+  read_twice "$w/cmp" "repos/$repo/compare/$old...$head" || full read-failed
+  jq -e --arg old "$old" '.status == "ahead" and .behind_by == 0 and .merge_base_commit.sha == $old' "$w/cmp" > /dev/null 2>&1 ||
+    full not-ancestor
+  [ "$(jq '.files | length' "$w/cmp")" -lt 300 ] || full scope-cap
+  IJ -e 'include "incremental"; all(.files[]; (.filename | plain_path) and (.previous_filename == null or (.previous_filename | plain_path)))' \
+    "$w/cmp" > /dev/null 2>&1 || full unsafe-path
+  num="$(jq '[.files[] | ([.additions + .deletions, 1] | max)] | add // 0' "$w/cmp")"
+  read_twice "$w/all" "repos/$repo/compare/$mb...$head" || full read-failed
+  [ "$(jq '.files | length' "$w/all")" -lt 300 ] || full scope-cap
+  den="$(jq '[.files[] | ([.additions + .deletions, 1] | max)] | add // 0' "$w/all")"
+  [ "$den" -gt 0 ] || full zero-denominator
+  [ $((num * 2)) -le "$den" ] || full ratio
+  # The scope: every touched path, and the files beside each one in the new head's tree.
+  read_twice "$w/tree" "repos/$repo/git/trees/$head?recursive=1" || full read-failed
+  jq -e '.truncated == false' "$w/tree" > /dev/null 2>&1 || full read-failed
+  IJ --slurpfile cmp "$w/cmp" 'include "incremental";
+    [.tree[] | select(.type == "blob") | .path] as $blobs
+    | ([$cmp[0].files[] | .filename, (.previous_filename // empty)] | unique) as $touched
+    | ($touched | map(dirname) | unique) as $dirs
+    | {touched: $touched, blobs: $blobs,
+       scope: ($touched + [$blobs[] | select(dirname | IN($dirs[]))] | unique)}' "$w/tree" > "$w/scope.json" ||
+    full read-failed
+  [ "$(jq '.scope | length' "$w/scope.json")" -le "$MAX_SCOPE" ] || full scope-cap
+  IJ -e 'include "incremental"; all(.scope[]; plain_path)' "$w/scope.json" > /dev/null 2>&1 || full unsafe-path
+  IJ -e --arg prefix "$prefix" 'include "incremental"; all(.scope[]; rel($prefix) != null and rel($prefix) != ".")' \
+    "$w/scope.json" > /dev/null 2>&1 || full outside-prefix
+  # The carried findings: a file rule on a file outside the scope that the new head still
+  # holds. A file in the scope is judged again, so its findings are not carried.
+  IJ --slurpfile sc "$w/scope.json" --slurpfile carry "$w/carry.json" --arg prefix "$prefix" '
+    include "incremental";
+    [.[] | select(($carry[0][.rule_id] // "never") == "file") | select(.file | IN($sc[0].scope[]) | not)]
+    | if all(.[]; (.file | IN($sc[0].blobs[])) and (.file | rel($prefix)) != null and (.file | rel($prefix)) != ".")
+      then map(del(.id)) else error("target") end' "$w/found.json" > "$stage/carried.json" 2> /dev/null || full target-not-file
+  IJ --arg prefix "$prefix" 'include "incremental"; map(.file |= rel($prefix))' "$stage/carried.json" > "$stage/carried-task.json"
+  IJ --arg prefix "$prefix" 'include "incremental"; [.scope[] | rel($prefix)]' "$w/scope.json" > "$stage/scope-task.json"
+  jq -n --arg head "$head" --arg old "$old" --arg mb "$mb" --arg lf "$last_full" --argjson depth "$((depth + 1))" \
+    --slurpfile sc "$w/scope.json" --argjson c "$commits" --argjson p "$pages" --argjson n "$num" --argjson d "$den" '
+    {format: 1, mode: "incremental", reason: "ok", head: $head, previous_head: $old, previous_merge_base: $mb,
+     depth: $depth, last_full: $lf, scope: $sc[0].scope,
+     metrics: {commits: $c, pages: $p, changed_since: $n, changed_total: $d}}' > "$stage/meta.json"
+  mv "$stage" "$out" || die "cannot create the output directory"
+  jq -r '"prior: incremental review since \(.previous_head), depth \(.depth), \(.scope | length) files in scope"' "$out/meta.json"
+  echo "prior: $(jq 'length' "$out/carried.json") findings carried"
+}
+
+check_prior() { # dir, head -> prints the verdict, returns 0 when accepted
+  local dir="$1" head="$2" names f
+  reject() { echo "prior rejected: $1"; return 1; }
+  [ -d "$dir" ] && [ ! -L "$dir" ] || { reject "not a directory"; return 1; }
+  names="$(cd "$dir" && LC_ALL=C ls -A)" || { reject "unreadable directory"; return 1; }
+  [ "$names" = "carried-task.json${NL}carried.json${NL}meta.json${NL}scope-task.json" ] || { reject "unexpected file set"; return 1; }
+  for f in carried-task.json carried.json meta.json scope-task.json; do
+    [ -f "$dir/$f" ] && [ ! -L "$dir/$f" ] || { reject "not a regular file"; return 1; }
+    [ "$(wc -c < "$dir/$f")" -le "$CAP" ] || { reject "over the size cap"; return 1; }
+  done
+  IJ -e --arg head "$head" --slurpfile c "$dir/carried.json" --slurpfile t "$dir/carried-task.json" \
+    --slurpfile st "$dir/scope-task.json" '
+    include "incremental";
+    . as $m0
+    | type == "object"
+    and keys == (["format", "mode", "reason", "head", "previous_head", "previous_merge_base", "depth",
+                  "last_full", "scope", "metrics"] | sort)
+    and .format == 1 and .head == $head and (.reason | type == "string" and test("^[a-z-]{1,40}$"))
+    and (.depth | type == "number" and . >= 0 and . <= 5 and . == floor)
+    and (.last_full | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+    and (.metrics | type == "object" and keys == ["changed_since", "changed_total", "commits", "pages"]
+         and all(.[]; type == "number" and . >= 0 and . == floor))
+    and ($c[0] | findings_list(false)) and ($t[0] | findings_list(false)) and ($c[0] | length) == ($t[0] | length)
+    and ($st[0] | type == "array" and all(.[]; plain_path) and length == ($m0 | .scope | length))
+    and (. as $m | if .mode == "full"
+         then .reason != "ok" and .scope == [] and .previous_merge_base == null and .depth == 0 and $c[0] == []
+         else .mode == "incremental" and .reason == "ok" and (.previous_head | sha40) and .previous_head != $head
+              and (.previous_merge_base | sha40) and .depth >= 1
+              and (.scope | type == "array" and length >= 1 and length <= 50 and all(.[]; plain_path))
+              and all($c[0][]; .file | IN($m.scope[]) | not) end)' "$dir/meta.json" > /dev/null 2>&1 ||
+    { reject "unexpected content"; return 1; }
+  echo "prior accepted: $(jq -r '.mode' "$dir/meta.json")"
+}
+
+cmd_check_prior() {
+  local dir="${1-}" head=""
+  shift || die "usage: host-pass.sh check-prior <dir> --head <sha>"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --head) head="${2-}"; shift 2 || die "--head needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  [[ "$head" =~ $sha_re ]] || die "--head must be a 40 character SHA"
+  check_prior "$dir" "$head"
+}
+
+cmd_record() {
+  local repo="" pr="" head="" base_ref="" mb="" skills="" facts="" verify="" mode="" depth="" lf="" findings="" out=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2-}"; shift 2 || die "--repo needs a value" ;;
+      --pr) pr="${2-}"; shift 2 || die "--pr needs a value" ;;
+      --head) head="${2-}"; shift 2 || die "--head needs a value" ;;
+      --base-ref) base_ref="${2-}"; shift 2 || die "--base-ref needs a value" ;;
+      --merge-base) mb="${2-}"; shift 2 || die "--merge-base needs a value" ;;
+      --skills) skills="${2-}"; shift 2 || die "--skills needs a value" ;;
+      --facts) facts="${2-}"; shift 2 || die "--facts needs a value" ;;
+      --verify) verify="${2-}"; shift 2 || die "--verify needs a value" ;;
+      --mode) mode="${2-}"; shift 2 || die "--mode needs a value" ;;
+      --depth) depth="${2-}"; shift 2 || die "--depth needs a value" ;;
+      --last-full) lf="${2-}"; shift 2 || die "--last-full needs a value" ;;
+      --findings) findings="${2-}"; shift 2 || die "--findings needs a value" ;;
+      --out) out="${2-}"; shift 2 || die "--out needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  case "$out" in /?*) ;; *) die "--out must be an absolute path" ;; esac
+  [ ! -e "$out" ] && [ ! -L "$out" ] || die "the output file already exists"
+  [ -f "$findings" ] && [ ! -L "$findings" ] || die "--findings must be a file"
+  IJ -e 'include "incremental"; findings_list(true)' "$findings" > /dev/null 2>&1 || die "the findings do not match the contract"
+  local sum line
+  sum="$(jq -S -c . "$findings" | openssl dgst -sha256 -r | cut -d' ' -f1)"
+  line="pofix-record v=1 repo=$repo pr=$pr head=$head base_ref=$base_ref merge_base=$mb skills=$skills facts=$facts verify=$verify mode=$mode depth=$depth last_full=$lf complete=true sha256=$sum"
+  jq -e -n -R --arg l "$line" -L "$HERE" 'include "incremental"; $l | header' > /dev/null 2>&1 || die "a record field is out of its pattern"
+  {
+    printf '%s\n\n<details><summary>Findings record for the next review</summary>\n\n```\n' "$line"
+    pack "$findings"
+    printf '```\n\n</details>\n'
+  } > "$out.tmp" || die "cannot write the record"
+  # No record at all is better than a partial one: an older valid record still decides.
+  if [ "$(wc -c < "$out.tmp")" -gt "$TEXT_CAP" ]; then
+    rm -f "$out.tmp"
+    echo "record: none, over $TEXT_CAP characters"
+    return 0
+  fi
+  mv "$out.tmp" "$out" || die "cannot write the record"
+  echo "record: $(wc -c < "$out" | tr -d ' ') characters, $(jq 'length' "$findings") findings"
+}
+
+cmd_accept() {
+  local prior="" findings="" result="" rules=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prior) prior="${2-}"; shift 2 || die "--prior needs a value" ;;
+      --findings) findings="${2-}"; shift 2 || die "--findings needs a value" ;;
+      --result) result="${2-}"; shift 2 || die "--result needs a value" ;;
+      --rules) rules="${2-}"; shift 2 || die "--rules needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  [ -f "$rules" ] && [ ! -L "$rules" ] || die "--rules must be the rule facts file"
+  reject() { echo "findings rejected: $1"; exit 1; }
+  [ -f "$findings" ] && [ ! -L "$findings" ] || reject "no findings file"
+  [ "$(wc -c < "$findings")" -le "$CAP" ] || reject "over the size cap"
+  IJ -e 'include "incremental"; findings_list(true)' "$findings" > /dev/null 2>&1 || reject "the findings do not match the contract"
+  local head
+  head="$(jq -r '.head_sha' "$result" 2> /dev/null)"
+  check_prior "$prior" "$head" > /dev/null || reject "the prior directory did not pass its check"
+  local verdict
+  verdict="$(jq -r '.verdict' "$result")"
+  IJ -e --arg v "$verdict" 'include "incremental"; host_verdict($v) == $v' "$findings" > /dev/null 2>&1 ||
+    reject "the verdict does not follow from the findings"
+  if [ "$(jq -r '.mode' "$prior/meta.json")" = full ]; then echo "findings accepted: full"; return 0; fi
+  local carry
+  carry="$(carry_map "$rules")" || reject "no carry column"
+  IJ -e --slurpfile c "$prior/carried.json" --slurpfile m "$prior/meta.json" --argjson carry "$carry" '
+    include "incremental";
+    (map(canon)) as $all
+    | all($c[0][]; canon as $x | ([$all[] | select(. == $x)] | length) == 1)' "$findings" > /dev/null 2>&1 ||
+    reject "a carried finding is missing, changed or repeated"
+  IJ -e --slurpfile c "$prior/carried.json" --slurpfile m "$prior/meta.json" --argjson carry "$carry" '
+    include "incremental";
+    ($c[0] | map(canon)) as $carried
+    | all(.[] | select((canon | IN($carried[])) | not);
+          ($carry[.rule_id] // "unknown") as $k
+          | $k == "never" or ($k == "file" and (.file | IN($m[0].scope[]))))' "$findings" > /dev/null 2>&1 ||
+    reject "a finding outside the scope of an incremental review"
+  echo "findings accepted: incremental"
+}
+
+cmd_incremental() { # --records <dir> --prior <dir>: the incremental lines into task.md
+  local rec="" pri=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --records) rec="${2-}"; shift 2 || die "--records needs a value" ;;
+      --prior) pri="${2-}"; shift 2 || die "--prior needs a value" ;;
+      *) die "unexpected argument" ;;
+    esac
+  done
+  case "$rec$pri" in *'`'*) die "a path holds a backtick" ;; esac
+  case "$rec" in /?*) ;; *) die "--records must be an absolute path" ;; esac
+  case "$pri" in /?*) ;; *) die "--prior must be an absolute path" ;; esac
+  local head
+  head="$(jq -r '.head_sha' "$rec/host.json" 2> /dev/null)"
+  [[ "$head" =~ $sha_re ]] || fail_run "the records hold no head"
+  check_records "$rec" "$head" > /dev/null || fail_run "the records did not pass their check"
+  check_prior "$pri" "$head" > /dev/null || fail_run "the prior directory did not pass its check"
+  if [ "$(jq -r '.mode' "$pri/meta.json")" = full ]; then echo "incremental: none, full review"; return 0; fi
+  ! grep -qE '^(Change|Previous review|Carried findings|Scope): ' "$rec/task.md" || fail_run "the task already holds incremental lines"
+  local lines
+  [[ "$pri" =~ ^/[A-Za-z0-9._/-]+$ ]] || fail_run "the prior path is not plain"
+  lines="$(IJ -r -n --slurpfile h "$rec/host.json" --slurpfile m "$pri/meta.json" --slurpfile st "$pri/scope-task.json" \
+    --arg c "$pri/carried-task.json" --arg sf "$pri/scope-task.json" '
+    include "incremental";
+    $h[0] as $h | $m[0] as $m
+    | if $h.merge_base != $m.previous_merge_base then error("merge base") else . end
+    | [$m.scope[] | rel($h.prefix)] as $scope
+    | if any($scope[]; . == null or . == ".") or $scope != $st[0] then error("scope") else . end
+    | "Change: \($h.merge_base)...\($h.head_sha)",
+      "Previous review: \($m.previous_head) \($m.previous_merge_base)",
+      "Carried findings: \($c)",
+      "Scope: \($sf)"')" || fail_run "the prior does not fit the records"
+  # The head revision line is the task's second line, before the block; the lines follow it.
+  { sed -n "1,/^Head revision: $head\$/p" "$rec/task.md"; printf '%s\n' "$lines"
+    sed "1,/^Head revision: $head\$/d" "$rec/task.md"; } > "$rec/task.md.tmp" &&
+    mv "$rec/task.md.tmp" "$rec/task.md" || fail_run "cannot write the task"
+  check_records "$rec" "$head" > /dev/null || fail_run "the records did not pass their check"
+  echo "incremental: task lines written, $(jq '.scope | length' "$pri/meta.json") files in scope"
+}
+
 case "${1-}" in
   checks) shift; cmd_checks "$@" ;;
   run) shift; cmd_run "$@" ;;
   check) shift; cmd_check "$@" ;;
-  *) die "usage: host-pass.sh checks|run|check ..." ;;
+  prior) shift; cmd_prior "$@" ;;
+  check-prior) shift; cmd_check_prior "$@" ;;
+  record) shift; cmd_record "$@" ;;
+  accept) shift; cmd_accept "$@" ;;
+  incremental) shift; cmd_incremental "$@" ;;
+  *) die "usage: host-pass.sh checks|run|check|prior|check-prior|record|accept|incremental ..." ;;
 esac

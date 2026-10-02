@@ -144,7 +144,7 @@ What each step produces, and what happens when it fails. Mechanics: [github-io.m
 | [schema-pass.md](references/schema-pass.md) | A host step, one script, [schema-pass.sh](references/schema-pass.sh): provider versions per module directory and fact sheets rendered from a schema mirror, for the reviewer's Budget |
 | [verdict.md](references/verdict.md) | Host signals, the verdict ladder, the clamps on the action |
 | [comment-format.md](references/comment-format.md) | Section order, voice, the leak scan, a worked example |
-| [render-output.md](references/render-output.md) | The two files a render-only run with no conversation writes for the adapter that posts: the body and the result |
+| [render-output.md](references/render-output.md) | The three files a render-only run with no conversation writes for the adapter that posts: the body, the findings and the result |
 | [terraform-module-reviewer](../terraform-module-reviewer/SKILL.md) | Produces every finding; this skill produces none |
 | [findings-schema.md](../terraform-module-reviewer/references/findings-schema.md) | The contract rendered findings conform to |
 | [change-scope](../change-scope/SKILL.md) | Whether an addition belongs at all: the reviewer's Check F judges it, and no pull request text clears it |

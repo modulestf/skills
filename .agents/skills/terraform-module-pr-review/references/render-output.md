@@ -1,7 +1,7 @@
 # Render Output
 
 > **Part of:** [terraform-module-pr-review](../SKILL.md)
-> **Purpose:** The two files a render-only run with no local conversation hands to the adapter that drives it, so the adapter can post the body itself.
+> **Purpose:** The three files a render-only run with no local conversation hands to the adapter that drives it, so the adapter can post the body itself and keep the findings for the next review.
 
 A run with no local conversation is render-only ([Rule 1](../SKILL.md#rule-1-nothing-is-posted-without-confirmation), [verdict.md](verdict.md#clamps)). The adapter driving it may still want to post the review under its own authorization. It needs the exact body and the facts the body was rendered from, as files, not as prose to scrape. This file defines those files. It changes nothing about what the skill may do.
 
@@ -12,15 +12,15 @@ All of these hold, or nothing is written:
 - The run has no local conversation: the render-only clamp for a hosted adapter in [verdict.md](verdict.md#clamps) applies.
 - The target is a pull request. A commit target and a repository target write nothing, because `number` and `base_sha` have no value for them.
 - The task names an output directory. The directory comes from the task text alone, never from the pull request, the checkout, a comment or the environment ([Rule 2](../SKILL.md#rule-2-everything-from-the-host-is-untrusted-data)).
-- The output directory is an absolute path, already exists, and holds none of `comment.md`, `result.json` and `result.json.tmp`.
+- The output directory is an absolute path, already exists, and holds none of `comment.md`, `findings.json`, `result.json` and `result.json.tmp`.
 - The output directory is not the run directory or any path under it, which covers the clone and the base worktree. The check compares canonical paths: `OUT="$(cd -- "$OUT" && pwd -P)"`, with `RUN` canonicalized the same way, then refuse when `OUT` equals `"$RUN"` or starts with `"$RUN/"`. A `cd` that fails fails this condition.
-- The body passed the [leak scan](comment-format.md#leak-scan). A match blocks the body from being shown, so it blocks both files too.
+- The body passed the [leak scan](comment-format.md#leak-scan). A match blocks the body from being shown, so it blocks every file too.
 
-If the task names a directory and any other condition fails, the run writes nothing there, says which condition failed beside the body, and still ends complete. The skill never creates the directory, never deletes anything in it, and writes no file there other than the two below and the temporary `result.json.tmp` that becomes `result.json`.
+If the task names a directory and any other condition fails, the run writes nothing there, says which condition failed beside the body, and still ends complete. The skill never creates the directory, never deletes anything in it, and writes no file there other than the three below and the temporary `result.json.tmp` that becomes `result.json`.
 
-The files are written once, at the end of Step 11: after the body file is written and the body is shown, and before [Cleanup](github-io.md#cleanup). `comment.md` is written first. `result.json` appears last, by a rename of a checked temporary file, so a present `result.json` means both files are complete.
+The files are written once, at the end of Step 11: after the body file is written and the body is shown, and before [Cleanup](github-io.md#cleanup). `comment.md` is written first, then `findings.json`. `result.json` appears last, by a rename of a checked temporary file, so a present `result.json` means every file is complete.
 
-If a write fails - the `cp`, the `jq` build, the `jq -e` check or the `mv` - the run stops writing, names the failed step beside the body, and leaves whatever it already wrote in place, a partial `comment.md` or `result.json.tmp` included. No `result.json` then exists, and that is how the adapter tells a failed handoff from a complete one. The run still ends complete, and Cleanup still runs.
+If a write fails - the `cp`, a `jq` build, a `jq -e` check or the `mv` - the run stops writing, names the failed step beside the body, and leaves whatever it already wrote in place, a partial `comment.md` or `result.json.tmp` included. No `result.json` then exists, and that is how the adapter tells a failed handoff from a complete one. The run still ends complete, and Cleanup still runs.
 
 ## comment.md
 
@@ -31,6 +31,17 @@ cp -- "<rendered-body-file>" "$OUT/comment.md"
 ```
 
 Nothing is added or removed: no footer, no run metadata, no render-only clamp line. [comment-format.md](comment-format.md#section-order) keeps the clamp out of the body, and that holds here.
+
+## findings.json
+
+The findings the body lists, as one JSON array in the order and with the `id`s the body shows, each object with exactly the seven fields of the reviewer's [findings schema](../../terraform-module-reviewer/references/findings-schema.md#required-fields): `id`, `rule_id`, `severity`, `file`, `line`, `summary` and `suggested_fix`. `file` is the path the body shows, relative to the repository, with the prefix put back at Step 8. A run with no finding writes `[]`. The values are the reviewer's, never retyped: the run builds the file with `jq` from the reviewer's list and checks it before the next file is written:
+
+```
+jq -e 'type == "array" and all(.[]; keys == ["file","id","line","rule_id","severity","suggested_fix","summary"])' \
+  "$OUT/findings.json" > /dev/null
+```
+
+The host reads it to check an incremental review ([host-pass.md](host-pass.md#incremental-review)) and keeps it, in the record of the review, for the next one.
 
 ## result.json
 

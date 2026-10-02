@@ -23,7 +23,7 @@ A line in any other form, or a path that is not absolute or holds a backtick, na
 bash <skill>/references/host-pass.sh check <directory> --head <head commit the task states>
 ```
 
-`check` prints `records accepted` only when the directory holds exactly `files.json`, `host.json` and `task.md`, and optionally `verify.json`, all regular files within their caps, `host.json` with exactly the keys and values the script writes and its `head_sha` equal to `--head`, `files.json` a list of file objects, and `task.md` with that head revision line and exactly one untrusted block. Otherwise it prints `records rejected: <reason>`. A rejection stops the run: it says the host records were rejected and why, and renders nothing, since the change itself is in the records. A head that moved after the request is rejected the same way.
+`check` prints `records accepted` only when the directory holds exactly `files.json`, `host.json` and `task.md`, and optionally `verify.json`, all regular files within their caps, `host.json` with exactly the keys and values the script writes and its `head_sha` equal to `--head`, `files.json` a list of file objects, and `task.md` with that head revision line, exactly one untrusted block and, when the host wrote them, the four lines of [Incremental Review](#incremental-review) in order. Otherwise it prints `records rejected: <reason>`. A rejection stops the run: it says the host records were rejected and why, and renders nothing, since the change itself is in the records. A head that moved after the request is rejected the same way.
 
 On acceptance, `headRefOid` is `head_sha`, and the target is `repo` and `number` from `host.json`, which must equal the pull request the request names; a mismatch stops the run.
 
@@ -125,6 +125,39 @@ Each field of `host.json` is an input to [verdict.md](verdict.md#the-ladder) or 
 | `related` | Section 6: with `status` `ok`, one line per `open_unlinked` reference, ``Open issue <ref> is not set to close on merge. Add `Closes <ref>` to the description.``, then `Sidebar links not read.` when `sidebar_not_read` is true and a line was rendered; `too-many` renders `Related issues exceed 10, so closing keywords were not checked.`; `failed` renders `Related issues could not be read, so closing keywords were not checked.`; `not-applicable` renders nothing |
 
 Three counts come from the reviewer's summary line, as on the interactive path: `instruction-like-text-from-others:<n>` and `conversation-claims-unread:<n>` for section 8's notes, and `review.quoted-claim-unverifiable:<n>`. Each `<n>` must be decimal digits alone; any other value is dropped and its line is not rendered.
+
+## Incremental Review
+
+A host may review only what moved since the last review it posted, when the change has grown by a small push. Everything here is the host's: [host-pass.sh](host-pass.sh) `prior`, `incremental`, `accept` and `record`, with the pure rules in [incremental.jq](incremental.jq). This skill only renders `findings.json` ([render-output.md](render-output.md#findingsjson)) and passes the task lines through, so a run with no such lines is a full review exactly as before.
+
+**The record.** After a full or incremental review is posted and the head, the base branch and the merge base are read again and unchanged, the host completes its own `pofix review` check run with a record in the check run's text, which only the App that created the run can change. The first line holds the fields, each with its own pattern, in this order: `v`, `repo` (`owner/name`), `pr`, `head`, `base_ref`, `merge_base`, `skills` (the commit of this repository the run used, which also pins the carry column and the findings schema), `facts`, `verify`, `mode`, `depth`, `last_full`, `complete` and `sha256`. Below it, in a collapsed block, `findings.json` in canonical form, compressed and base64 encoded; `sha256` is the hash of that canonical form and finds corruption only. A record over 65,535 characters is not written at all, so an older valid one still decides. A triage run writes no record.
+
+**Prior, in the review job before the model starts.** `prior` walks the pull request's commits newest first, at most 50, and at most 20 pages of check runs on any one commit. A candidate is a completed check run named exactly `pofix review` from the App's numeric id whose text opens with a record. The newest candidate decides: if it fails any check, the review is full, and no older record is read. The review is full, with the reason in the job summary, when:
+
+- no candidate is found (`none-found`), or the caps are reached (`commit-cap`, `page-cap`), or a read fails (`read-failed`);
+- the record is malformed, names another repository, pull request or head, or its findings do not decode, match their hash or fit the schema (`invalid-record`);
+- its head is the head under review (`same-head`): a re-run on the same head is a full review, never an empty incremental one;
+- the previous head is not an ancestor of the new one (`not-ancestor`), as after a force push;
+- the base branch changed (`base-ref-changed`), or the merge base moved (`merge-base-moved`), as after a merge from the base;
+- the skills, provider facts or verification setup changed (`skills-changed`, `facts-changed`, `verify-changed`);
+- five incremental reviews followed the last full one (`depth-cap`), or the last full one is more than seven days old or in the future (`age-cap`);
+- the change since the previous head is more than half of the whole change (`ratio`), or the whole change is empty (`zero-denominator`); each count is the sum over files of added plus deleted lines from the compare of the two commits, a file with neither, such as a binary, counting 1;
+- the compare lists 300 files or more, or the scope holds more than 50 files (`scope-cap`), or a touched or scope path is not a plain relative path of letters, digits, `.`, `_`, `-` and `/` (`unsafe-path`), or a scope file lies outside the module root (`outside-prefix`);
+- a finding to carry targets a file the new head does not hold (`target-not-file`);
+- the pinned rule facts have no Carry column (`no-carry-column`), or the run has no own check run or no merge base (`no-own-check`, `no-merge-base`);
+- a full review was asked for (`requested`).
+
+The touched set is every path the compare of the previous head to the new one lists, a renamed file's old path included. The scope is the touched set and every file beside a touched one in the new head's tree, not recursively. A finding is carried only when its rule is `file` in the Carry column of the reviewer's [rule-facts.md](../../terraform-module-reviewer/references/rule-facts.md) and its file is outside the scope; a rule the table does not name is `never`. `prior` writes `meta.json`, `carried.json` with repository-relative paths `carried-task.json` with module-relative ones for the reviewer, and `scope-task.json`, the scope relative to the module root; `check-prior` checks them.
+
+**The task lines.** `incremental` writes four lines right after the head revision line of the records' `task.md`, from the checked prior and only when its merge base is the records' own: `Change: <merge base>...<head>`, `Previous review: <previous head> <previous merge base>`, `Carried findings: <absolute path of carried-task.json>` and `Scope: <absolute path of scope-task.json>`, a JSON list of module-relative paths. No file name from the change appears in these lines, and every path in the scope uses only letters, digits, `.`, `_`, `-` and `/`: any other name means a full review (`unsafe-path`). They are the reviewer's [Incremental Task Lines](../../terraform-module-reviewer/references/findings-schema.md#incremental-task-lines). The records check accepts them only in that order and for the records' head. Handover passes them through like the rest of `task.md`.
+
+**Accept, after the model and before anything is posted.** `accept` reads `findings.json` and `result.json`. After any prior it checks the schema and the verdict below. After an incremental one it also checks that:
+
+- every carried finding appears exactly once, compared as canonical JSON objects with the `id` left out;
+- every other finding is a `never` rule, or a `file` rule on a file in the scope; a rule the table does not name never passes, on the module root or anywhere else;
+- the verdict follows from the accepted findings: rules 0 to 2 and 6 to 8 of [The Ladder](verdict.md#the-ladder) read only the findings, so the host decides them, and the model's verdict stands for rules 3 to 5, which read host signals, and only toward the stricter answer. The function is `host_verdict` in [incremental.jq](incremental.jq), and the verdict the body shows must equal it. It sees only the findings and the model's verdict, never the unknowns that are not findings - an example whose verification did not run, truncated prose, a patch that was unavailable - so a model that approves despite one of those is not caught here; the skill's own ladder is the only check of them.
+
+Ids are never renumbered after the body is rendered: the reviewer copies the carried findings into its own list, this skill renders and numbers that list once, and `findings.json` is that list. A rejection fails closed: nothing is posted, and the check run is completed as neutral with a fixed reason. The next request is a full review only when it asks for one, as the `full` command does.
 
 ## Cleanup
 
