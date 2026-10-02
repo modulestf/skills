@@ -60,7 +60,7 @@ bash /abs/path/plan-runner/run-pass.sh --build --clone "$RUN/runner-clone" \
 
 ## Hosted runner
 
-A host may run the isolated runner itself and hand the run one file. The hosted review workflow does this for a maintainer's `@pofix plan` request: a plan job of its own runs [plan-runner/run-pass.sh](plan-runner/README.md#the-plan-pass-in-the-runner) on a GitHub-hosted runner, with the runner's network check before the first session, and then reduces the record with [plan-runner/hosted-record.sh](plan-runner/hosted-record.sh):
+A host may run the isolated runner itself and hand the run one file. The hosted review workflow does this for a maintainer's `@modulestf plan` request: a plan job of its own runs [plan-runner/run-pass.sh](plan-runner/README.md#the-plan-pass-in-the-runner) on a GitHub-hosted runner, with the runner's network check before the first session, and then reduces the record with [plan-runner/hosted-record.sh](plan-runner/hosted-record.sh):
 
 ```
 bash plan-runner/hosted-record.sh --record <record dir> --head <head> --merge-base <merge base> --out plan-hosted.json

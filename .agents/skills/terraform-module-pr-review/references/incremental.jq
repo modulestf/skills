@@ -42,7 +42,7 @@ def canon: del(.id) | to_entries | sort_by(.key) | from_entries;
 
 # The header line of a record, field by field in a fixed order, each with its own pattern.
 def header_re:
-  "^pofix-record v=1 repo=(?<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+) pr=(?<pr>[1-9][0-9]{0,9})"
+  "^modulestf-record v=1 repo=(?<repo>[A-Za-z0-9._-]+/[A-Za-z0-9._-]+) pr=(?<pr>[1-9][0-9]{0,9})"
   + " head=(?<head>[0-9a-f]{40}) base_ref=(?<base_ref>[A-Za-z0-9._/-]{1,255})"
   + " merge_base=(?<merge_base>[0-9a-f]{40}) skills=(?<skills>[0-9a-f]{40})"
   + " facts=(?<facts>[0-9a-f]{64}|none) verify=(?<verify>[A-Za-z0-9._-]{1,64})"

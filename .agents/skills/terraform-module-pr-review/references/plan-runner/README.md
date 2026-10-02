@@ -8,7 +8,7 @@ runtime and no AWS infrastructure. `run-pass.sh` runs the whole plan pass,
 runs a bare `init` and `plan` for one example, for the smoke test. The pull request skill's
 plan pass calls `run-pass.sh` when a container runtime is available, and runs the laptop pass
 otherwise ([Runner or laptop](../plan-pass.md#runner-or-laptop)). The hosted review workflow's
-plan job runs `run-pass.sh` on a GitHub-hosted runner for a maintainer's `@pofix plan` request,
+plan job runs `run-pass.sh` on a GitHub-hosted runner for a maintainer's `@modulestf plan` request,
 and `hosted-record.sh` reduces its record to `plan-hosted.json`, classes and counts only
 ([Hosted runner](../plan-pass.md#hosted-runner)). Nothing calls `run-plan.sh` but the smoke test.
 

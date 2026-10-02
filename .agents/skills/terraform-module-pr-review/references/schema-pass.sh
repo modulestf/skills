@@ -2,7 +2,7 @@
 # schema-pass.sh: resolves provider versions per module directory and renders provider
 # fact sheets from a schema mirror. See schema-pass.md for the inputs, the layout and the
 # reason codes. Usage: schema-pass.sh <facts output directory> <work directory>
-# Environment: SCHEMA_PROVIDERS, SCHEMA_TYPES (the gate's tokens), POFIX_SCHEMA_MIRROR.
+# Environment: SCHEMA_PROVIDERS, SCHEMA_TYPES (the gate's tokens), MODULESTF_SCHEMA_MIRROR.
 # Nothing downloaded is run. Every body is size-checked before any parser reads it.
 set -uo pipefail
 set -f
@@ -11,7 +11,7 @@ OUT="${1:?facts output directory}"
 WORK="${2:?work directory}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 FACTS_JQ="$HERE/schema-facts.jq"
-: "${SCHEMA_PROVIDERS=}" "${SCHEMA_TYPES=}" "${POFIX_SCHEMA_MIRROR=}"
+: "${SCHEMA_PROVIDERS=}" "${SCHEMA_TYPES=}" "${MODULESTF_SCHEMA_MIRROR=}"
 
 MAX_PROVIDERS=32
 MAX_PROVIDER_VERSIONS=96
@@ -242,18 +242,18 @@ awk -v m="$MAX_TYPES" 'NR <= m' "$WORK/tall" > "$WORK/tkeep"
 # 4. Each provider version: download, check, render, all in its own staging directory.
 : > "$WORK/pvok"
 : > "$WORK/status"
-if [[ -n "$POFIX_SCHEMA_MIRROR" && ! "$POFIX_SCHEMA_MIRROR" =~ $mirror_re ]]; then
-  echo "schema pass: POFIX_SCHEMA_MIRROR is not owner/name; no mirror"
-  POFIX_SCHEMA_MIRROR=""
+if [[ -n "$MODULESTF_SCHEMA_MIRROR" && ! "$MODULESTF_SCHEMA_MIRROR" =~ $mirror_re ]]; then
+  echo "schema pass: MODULESTF_SCHEMA_MIRROR is not owner/name; no mirror"
+  MODULESTF_SCHEMA_MIRROR=""
 fi
 while read -r -u 3 prov ver; do
-  [ -n "$POFIX_SCHEMA_MIRROR" ] || break
+  [ -n "$MODULESTF_SCHEMA_MIRROR" ] || break
   ns="${prov%%/*}" name="${prov#*/}"
   [[ "$ver" =~ $ver_re ]] || continue
   d="$WORK/dl" st="$WORK/stage/$ns/$name/$ver"
   rm -rf "$d" && mkdir -p "$d" "$st" || exit 1
   sf="${ns}_${name}-${ver}.schema.json.gz"
-  base="https://github.com/$POFIX_SCHEMA_MIRROR/releases/download/${ns}_${name}-v${ver}"
+  base="https://github.com/$MODULESTF_SCHEMA_MIRROR/releases/download/${ns}_${name}-v${ver}"
   bad=""
   for a in "SHA256SUMS $CAP_SUMS" "manifest.json $CAP_MANIFEST" "$sf $CAP_GZ"; do
     f="${a% *}" cap="${a#* }"

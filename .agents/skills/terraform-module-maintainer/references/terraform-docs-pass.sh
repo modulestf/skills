@@ -335,7 +335,7 @@ ensure_tool() { # sets TOOL, or FAIL; a failure is the whole run's
   cache=$TFDOCS_PASS_CACHE_DIR
   if [ -z "$cache" ]; then
     value home "$(left)" home_dir && [ -n "$home" ] && [ -d "$home" ] || { FAIL=$TOOL_FAIL; return 1; }
-    if [ "$OS" = darwin ]; then cache=$home/Library/Caches/pofix-terraform-docs; else cache=$home/.cache/pofix-terraform-docs; fi
+    if [ "$OS" = darwin ]; then cache=$home/Library/Caches/modulestf-terraform-docs; else cache=$home/.cache/modulestf-terraform-docs; fi
   fi
   [ -e "$cache" ] || [ -L "$cache" ] || { mkdir -p -- "$(dirname -- "$cache")" && mkdir -m 700 -- "$cache"; } ||
     { FAIL=$TOOL_FAIL; return 1; }

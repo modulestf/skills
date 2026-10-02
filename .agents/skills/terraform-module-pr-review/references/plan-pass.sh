@@ -414,7 +414,7 @@ get_creds() {
   else
     # A session on the review role, downscoped by the pinned policy; never the profile's own
     # Its reason on standard error is for the operator; this output is the record
-    CREDS="$(bash "$HERE/plan-session.sh" "$PROFILE" "$ROLE_ARN" pofix-plan-pass 2> /dev/null)" || return 1
+    CREDS="$(bash "$HERE/plan-session.sh" "$PROFILE" "$ROLE_ARN" modulestf-plan-pass 2> /dev/null)" || return 1
     AK="$(printf '%s' "$CREDS" | jq -er .AccessKeyId)" || return 1
     SK="$(printf '%s' "$CREDS" | jq -er .SecretAccessKey)" || return 1
     ST="$(printf '%s' "$CREDS" | jq -er .SessionToken)" || return 1

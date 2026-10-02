@@ -1,4 +1,4 @@
-# pofix skills
+# modulestf skills
 
 Agent skills for reviewing and maintaining reusable Terraform modules, following the terraform-aws-modules conventions:
 

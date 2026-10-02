@@ -153,7 +153,7 @@ issue_session() {
   local creds
   # plan-session.sh's fixed reason reaches the operator on this script's standard error,
   # never the record
-  if creds="$(bash "$session" "$profile" "$role_arn" "pofix-plan-$sfx")"; then
+  if creds="$(bash "$session" "$profile" "$role_arn" "modulestf-plan-$sfx")"; then
     jq -r '"AWS_ACCESS_KEY_ID=\(.AccessKeyId)", "AWS_SECRET_ACCESS_KEY=\(.SecretAccessKey)", "AWS_SESSION_TOKEN=\(.SessionToken)"' <<< "$creds" | write_pass_env
   else
     echo "run-pass: no session for this plan container; its plan pass ends at credentials" >&2

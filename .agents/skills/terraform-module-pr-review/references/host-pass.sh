@@ -5,7 +5,7 @@
 # own checkout of this repository pinned by commit; never from the head or the workspace.
 #
 #   host-pass.sh checks --repo <owner/name> --head <sha> --out <dir>
-#       (--own-pairs "<id>:<suite> ..." | --own-unreadable) [--own-check "pofix review" --app <slug>]
+#       (--own-pairs "<id>:<suite> ..." | --own-unreadable) [--own-check "modulestf review" --app <slug>]
 #       Reads the head's check runs and combined commit status, drops the host's own job
 #       check runs by exact pair and the host's own check by name and App slug, keeps the
 #       latest run of each check, and writes <dir>/checks.json. Exits 0 when the file is
@@ -79,7 +79,7 @@ def valid($head):
   and (.head_sha | type == "string" and test("^[0-9a-f]{40}$")) and .head_sha == $head
   and (.signal | IN("pass", "fail", "unknown"))
   and (.reads | IN("ok", "failed"))
-  and (.own_check == null or .own_check == "pofix review")
+  and (.own_check == null or .own_check == "modulestf review")
   and (.own_check_dropped | nat) and (.own_jobs_dropped | nat)
   and (.own_jobs_unreadable | type == "boolean")
   and (.check_runs | type == "array" and all(.[];
@@ -139,7 +139,7 @@ cmd_checks() {
     [[ -z "$pairs" || "$pairs" =~ $pairs_re ]] || die "--own-pairs must be <id>:<suite> pairs"
   fi
   if [ -n "$own" ] || [ -n "$app" ]; then
-    [ "$own" = "pofix review" ] || die "--own-check must be \"pofix review\""
+    [ "$own" = "modulestf review" ] || die "--own-check must be \"modulestf review\""
     [[ "$app" =~ $slug_re ]] || die "--app must be an App slug"
   fi
 
@@ -725,14 +725,14 @@ cmd_prior() {
     [[ "$sha" =~ $sha_re ]] || full read-failed
     commits=$((commits + 1))
     [ "$commits" -le "$MAX_COMMITS" ] || full commit-cap
-    read_twice "$w/runs" --paginate "repos/$repo/commits/$sha/check-runs?check_name=pofix%20review&filter=all&per_page=100" \
+    read_twice "$w/runs" --paginate "repos/$repo/commits/$sha/check-runs?check_name=modulestf%20review&filter=all&per_page=100" \
       --jq '{page: 1, runs: [.check_runs[] | {id, name, app_id: .app.id, status, head_sha, text: (.output.text // "")}]}' ||
       full read-failed
     # The page cap is per commit; the total is reported.
     [ "$(grep -c '"page":1' "$w/runs")" -le "$MAX_RUN_PAGES" ] || full page-cap
     pages=$((pages + $(grep -c '"page":1' "$w/runs")))
-    jq -s --argjson app "$app" '[.[].runs[] | select(.name == "pofix review" and .app_id == $app
-        and .status == "completed" and (.text | startswith("pofix-record ")))] | max_by(.id) // empty' \
+    jq -s --argjson app "$app" '[.[].runs[] | select(.name == "modulestf review" and .app_id == $app
+        and .status == "completed" and (.text | startswith("modulestf-record ")))] | max_by(.id) // empty' \
       "$w/runs" > "$w/cand" 2> /dev/null || full read-failed
     if [ -s "$w/cand" ]; then found="$sha"; break; fi
   done < <(tail -r "$w/commits" 2> /dev/null || tac "$w/commits")
@@ -884,7 +884,7 @@ cmd_record() {
   IJ -e 'include "incremental"; findings_list(true)' "$findings" > /dev/null 2>&1 || die "the findings do not match the contract"
   local sum line
   sum="$(jq -S -c . "$findings" | openssl dgst -sha256 -r | cut -d' ' -f1)"
-  line="pofix-record v=1 repo=$repo pr=$pr head=$head base_ref=$base_ref merge_base=$mb skills=$skills facts=$facts verify=$verify mode=$mode depth=$depth last_full=$lf complete=true sha256=$sum"
+  line="modulestf-record v=1 repo=$repo pr=$pr head=$head base_ref=$base_ref merge_base=$mb skills=$skills facts=$facts verify=$verify mode=$mode depth=$depth last_full=$lf complete=true sha256=$sum"
   jq -e -n -R --arg l "$line" -L "$HERE" 'include "incremental"; $l | header' > /dev/null 2>&1 || die "a record field is out of its pattern"
   {
     printf '%s\n\n<details><summary>Findings record for the next review</summary>\n\n```\n' "$line"

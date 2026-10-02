@@ -6,7 +6,7 @@
 The pass is one script, [schema-pass.sh](schema-pass.sh), with its renderer in [schema-facts.jq](schema-facts.jq). A host runs it from its own checkout of this repository pinned by commit, never from the head, with no credential of any kind, and hands the reviewer the output directory and the versions line. Nothing it downloads is run: the schema is data for `jq`, and a fact sheet is data for the reviewer under Rule 3. `tests/schema-pass-test.sh` checks the script and the renderer with the network stubbed.
 
 ```sh
-SCHEMA_PROVIDERS="<tokens>" SCHEMA_TYPES="<tokens>" POFIX_SCHEMA_MIRROR="<owner>/<name>" \
+SCHEMA_PROVIDERS="<tokens>" SCHEMA_TYPES="<tokens>" MODULESTF_SCHEMA_MIRROR="<owner>/<name>" \
   bash schema-pass.sh <facts output directory> <work directory>
 ```
 
