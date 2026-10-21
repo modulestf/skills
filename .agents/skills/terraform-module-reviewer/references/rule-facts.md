@@ -118,6 +118,23 @@ The registry columns are for the deterministic facts engine designed in [the fac
 | `structure.version-floor-understated` | none | - | - | never | candidate | config-semantic | touched-block | yes | root, submodule, example | candidates, interface-diff | CRITICAL, HIGH | lead | lead |
 | `structure.wrong-file` | none | - | - | never | candidate | config-semantic | newly-introduced | no | root, submodule | candidates, file-index | MEDIUM | lead | small |
 
+## Dedup Overlap
+
+Step 2 of the merge in [the facts engine spec](../../../../docs/superpowers/specs/2026-10-19-deterministic-review-facts-design.md#model-output-and-merge) deduplicates across rules only by this table. Pair 1 is derived from the pair the [Final Step](../SKILL.md#final-step-assemble-the-findings) names; pair 2 and the unmerged list below are the owner's decisions of 2026-10-21. Nothing in this skill reads the table yet. A row applies only when its "Same defect when" condition holds. The kept finding takes the higher severity of the two, and keeps its own text.
+
+| Pair | Kept | Dropped | Same defect when | From |
+|------|------|---------|------------------|------|
+| 1 | `compat.default-changed` | `structure.flag-polarity` | Both are about one new `enable_*` or `attach_*` input that defaults to `true`, on the same subject: Check A's behaviour change for every existing caller and Check C's polarity defect. | Final Step, the polarity pair |
+| 2 | The `compat.*` finding for the break | `profile.commit-type-mismatch` | The title's type or its missing `!` misreports that same break, the case [Check E](check-e-profile.md) gives for a breaking change released under a title with no `!` and no `BREAKING CHANGE:` trailer. | Final Step, the code over the description; owner decision |
+
+Not deduplicated, so both findings are kept:
+
+- A break in the code and `compat.claim-contradicts-analysis` about that break: the Final Step carve-out, and [Check A](check-a-compatibility.md) says the pair is not deduplicated.
+- A break in the code and `compat.break-unexplained` about that break: Check A says it never replaces the finding for the break.
+- A `scope.*` file rule and a `profile.*` rule on the same path for the same edit. [Check F](check-f-scope.md) calls them one defect and lists its pairs as examples, "not a closed list". The owner decided they stay unmerged in step 2, so both are kept.
+
+The Final Step's general clause, "where two rules describe the same break, the rule naming the code wins over the rule naming the author's description", is the source of pair 2. Check A carves out its two rules that judge the description of the break, `compat.claim-contradicts-analysis` and `compat.break-unexplained`. `profile.commit-type-mismatch` judges the title, not Check A's description rules, so the clause still covers it.
+
 ## Carry Audit
 
 The evidence each `file` rule reads, all of it in the target file:

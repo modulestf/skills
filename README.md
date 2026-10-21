@@ -7,4 +7,4 @@ Agent skills for reviewing and maintaining reusable Terraform modules, following
 - `.agents/skills/terraform-module-maintainer`: creates, changes, fixes and upgrades modules.
 - `.agents/skills/change-scope`: decides whether an addition belongs in the thing being changed.
 
-This repository is a snapshot published for the pull request review workflow, which fetches it pinned by commit SHA. Links to the measured review fixtures point to a file that is not published here.
+This repository is a snapshot published for the pull request review workflow, which fetches it pinned by commit SHA. Links to the measured review fixtures and to the source repository's tests point to files that are not published here.

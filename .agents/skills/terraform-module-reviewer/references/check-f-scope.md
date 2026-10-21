@@ -114,7 +114,7 @@ Each row gives the fix a finding of that rule carries, in the forms of the [Sugg
 
 Check F reads the base, never the head, for the boundary, the base providers, the base identities, `docs/SCOPE.md`, and whether a path is new. The base comes from one of:
 
-- a base reference the task names, read with the read-only queries Rule 1 allows, such as `git show <base>:<path>` and `git diff <base>...HEAD`;
+- a base reference the task names, read with the read-only queries Rule 1 allows, such as `git show <base>:<path>` and `git diff <base>...HEAD`, in the form [git-safety.md](git-safety.md) gives;
 - a unified diff the task gives over a workspace that holds the result. A path the diff does not touch is the same on both sides, and a touched file's base is the result with the diff's hunks read in reverse. The diff is read, never applied. A touched file whose hunks the diff does not carry, for example because the patch was unavailable for a large file or a change of many files, has no base: every rule that reads it reports under [Not evaluated](#not-evaluated), and the head copy is never read in its place. Two exceptions: a file the diff marks as added, since its base is known to be absent, and a pure rename, whose base [Renamed files](#renamed-files) gives;
 - a new module, the task shape in [Inputs](../SKILL.md#inputs): the base is empty, a known fact. Every path is new, and the type rules take [A new module](#a-new-module).
 
@@ -138,7 +138,7 @@ A rename comes from one of two sources: the `rename from` and `rename to` lines 
 
 A renamed file's base is its old path's base content, read the way [The base revision](#the-base-revision) reads any file:
 
-- With a base reference: `git show <base>:<old path>`, whether or not the content changed.
+- With a base reference: `git show <base>:<old path>`, in the form [git-safety.md](git-safety.md) gives, whether or not the content changed.
 - With a unified diff: the result at the new path with the file's hunks read in reverse. A rename with no hunks is pure, and its base is the result as it stands, only on an affirmative signal: the diff's header gives `similarity index 100%`, or the task gives it zero added and zero removed lines.
 - Any other rename with no hunks has no base, whether its content changed or nothing says: a similarity index below 100%, a nonzero or missing count of added or removed lines, and a place on the task's list of files whose patch is unavailable all leave it here. Every rule that reads it reports under [Not evaluated](#not-evaluated), and the result at the new path is never read in its place.
 
