@@ -7,12 +7,15 @@ The pass is one script, [schema-pass.sh](schema-pass.sh), with its renderer in [
 
 ```sh
 SCHEMA_PROVIDERS="<tokens>" SCHEMA_TYPES="<tokens>" MODULESTF_SCHEMA_MIRROR="<owner>/<name>" \
-  bash schema-pass.sh <facts output directory> <work directory>
+  SCHEMA_HEAD="<sha>" SCHEMA_MERGE_BASE="<sha>" SCHEMA_INPUTS="<tokens>" \
+  bash schema-pass.sh <facts output directory> <work directory> [<handoff directory>]
 ```
+
+With a handoff directory, the same run also writes the [schema handoff](#schema-handoff) for the facts engine.
 
 ## Inputs
 
-Tokens read from the `.tf` text of the head and the base, never by running anything. Every token is checked again against these patterns before use, and a token that fails is dropped.
+Tokens read from the `.tf` text of the head and of its merge base with the base branch (the `base` revision), never by running anything. Every token is checked again against these patterns before use, and a token that fails is dropped.
 
 - Provider, per revision and module directory: `<rev>:<dir>:<local>=<namespace>/<name>:<constraint>`, the constraints of that local name joined by commas, spaces removed; `<rev>:<dir>:!constraint_unparsable` for a directory whose `required_providers` could not be read or gives a local name two sources; `<rev>:<dir>:<local>=!registry_host` for a source on another registry host.
 - Type, per head directory: `<dir>:<resource|data>:<type>:<namespace>/<name>`, bound by the block's `provider` argument, else the type's prefix, then that local name's source, else `hashicorp/<local>`. The builtin `terraform` provider's types get no token.
@@ -100,6 +103,20 @@ A type is read from sheets only when every version it is needed at is `sheet` or
 Each provider version is built in its own staging directory and moved into the output only after every check passed, so a step killed part-way publishes whole versions or none of them. The work directory also gets `wanted-pages`: for a host page cache, each needed version of a `page` type and the latest version of every other type. A type whose name does not start with `<name>_`, such as a `google-beta` type, has no page cache path and is left out; the reviewer fetches its page itself, which changes cost only.
 
 A host checks the output again before a reviewer sees it: `files.sha256` must name every other file exactly once with a matching hash, every file must be a regular file under a size cap at an output path, and `versions.json` must have the shape above. Any mismatch discards the whole output; the page cache is separate and stays.
+
+## Schema Handoff
+
+The input of the facts engine: `<handoff directory>/schema-handoff.json.gz`, one gzipped JSON document in the shape of `schema/schema-handoff.schema.json` in the `modulestf/facts` repository. The reviewer never reads it.
+
+- **Commits:** `head_sha` and `merge_base_sha`, from `SCHEMA_HEAD` and `SCHEMA_MERGE_BASE`, each 40 lowercase hex.
+- **Inputs:** `SCHEMA_INPUTS` holds one token per `.tf` file the needs were read from, `<commit>:<SHA-256>:<path>`, the path relative to the repository root, up to 9 segments of `^[A-Za-z0-9._-]{1,64}$`, none `.` or `..`, ending in `.tf`. Per revision, `inputs.head` and `inputs.merge_base` list each path once with its SHA-256, sorted by the bytes of the path, and `tree_hash` is the SHA-256 of the lines `<sha256>  <path>` in that order, the layout of `sha256sum` output. A token for the same file in both revisions, as when the merge base is the head, counts once in each.
+- **Directories:** per head directory and `required_providers` local name, or the provider's name when it has no entry there, with the source as `registry.terraform.io/<namespace>/<name>`: `latest`, `declared_minimum` and `old_floor` as in [Versions](#versions), except that the old floor is given even when it equals the minimum, and is `null` when the merge base has no `required_providers` entry for that provider in that directory. Otherwise one `unresolved_reason`: the pair's reason; `no_lower_bound` when the head constraints have no lower bound; or `old_floor_` and the reason when the old floor is unresolved, `old_floor_no_lower_bound` when the merge base constraints have no lower bound. A local name outside `^[a-z][a-z0-9_-]{0,63}$` and a source on another registry host are left out.
+- **Provider schemas:** for each provider version read from the mirror, every resource and data source type, filtered by [schema-handoff.jq](schema-handoff.jq): attribute names with `required`, `optional`, `computed` and `deprecated` when true, nested attribute types, nested block names, nesting modes and item limits, and the type's own deprecation. Every other field is dropped, descriptions and cty types included. A name outside the fact sheet name pattern, a flag that is not a boolean, an unknown nesting mode or a `group` nested attribute type fails the whole version, which is then left out: a type left out alone would read as absent from the schema. The fact sheets do not depend on it.
+- **Caps:** at most 128 MiB uncompressed and 16 MiB gzipped, both recorded in `caps`.
+
+There is no handoff, and the step output says `schema pass: no handoff, <code>`, when: a commit is missing or not 40 hex (`no_commits`); a token is outside its pattern (`inputs`); a token names a commit other than the head or the merge base (`sha_mismatch`); one path has two hashes in a revision (`duplicate_path`); the document cannot be built (`json_shape`); it is over a cap (`cap_exceeded`); or it cannot be moved into the handoff directory (`write_failed`). The document is built in the work directory and moved into place whole, so a run publishes all of it or nothing. The fact sheets and `versions.json` are written either way, and no handoff refusal fails the run.
+
+What the gate reads as the inputs, which a consumer that compares tree hashes must match: every git tree entry of type blob whose path ends in `.tf`, at the head and at the merge base, except a blob over 1 MiB, which is left out. A symbolic link is a blob too, so it counts with the SHA-256 of its target text, never of the file it points to. A consumer whose own file set differs in either case gets another tree hash and treats the handoff as not covering that revision. When the merge base cannot be read, the gate reads the base branch for the needs and gives no inputs and no merge base, so there is no handoff.
 
 ## Reason Codes
 

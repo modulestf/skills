@@ -1,8 +1,9 @@
 #!/bin/bash
 # schema-pass.sh: resolves provider versions per module directory and renders provider
 # fact sheets from a schema mirror. See schema-pass.md for the inputs, the layout and the
-# reason codes. Usage: schema-pass.sh <facts output directory> <work directory>
-# Environment: SCHEMA_PROVIDERS, SCHEMA_TYPES (the gate's tokens), MODULESTF_SCHEMA_MIRROR.
+# reason codes. Usage: schema-pass.sh <facts output directory> <work directory> [<handoff directory>]
+# Environment: SCHEMA_PROVIDERS, SCHEMA_TYPES (the gate's tokens), MODULESTF_SCHEMA_MIRROR,
+# and for the schema handoff SCHEMA_HEAD, SCHEMA_MERGE_BASE and SCHEMA_INPUTS.
 # Nothing downloaded is run. Every body is size-checked before any parser reads it.
 set -uo pipefail
 set -f
@@ -11,7 +12,10 @@ OUT="${1:?facts output directory}"
 WORK="${2:?work directory}"
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
 FACTS_JQ="$HERE/schema-facts.jq"
+HANDOFF_JQ="$HERE/schema-handoff.jq"
+HANDOFF="${3:-}"
 : "${SCHEMA_PROVIDERS=}" "${SCHEMA_TYPES=}" "${MODULESTF_SCHEMA_MIRROR=}"
+: "${SCHEMA_HEAD=}" "${SCHEMA_MERGE_BASE=}" "${SCHEMA_INPUTS=}"
 
 MAX_PROVIDERS=32
 MAX_PROVIDER_VERSIONS=96
@@ -21,6 +25,8 @@ CAP_MANIFEST=16384
 CAP_VERSIONS=2097152
 CAP_GZ=8388608
 CAP_SCHEMA=134217728
+CAP_HANDOFF=134217728
+CAP_HANDOFF_GZ=16777216
 MIRROR_HOSTS="github.com objects.githubusercontent.com release-assets.githubusercontent.com"
 REGISTRY_HOSTS="registry.terraform.io"
 
@@ -32,10 +38,13 @@ type_re='^[a-z][a-z0-9_]{0,127}$'
 dir_re='^(\.|[A-Za-z0-9._-]{1,64}(/[A-Za-z0-9._-]{1,64}){0,7})$'
 con_re='^[0-9A-Za-z.,<>=~! -]{0,64}$'
 mirror_re='^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$'
+sha_re='^[0-9a-f]{40}$'
+input_re='^([0-9a-f]{40}):([0-9a-f]{64}):(([A-Za-z0-9._-]{1,64}/){0,8}[A-Za-z0-9._-]{1,64}\.tf)$'
 reason_re='^(not_in_mirror|network|http_error|rate_limited|host_rejected|redirect_limit|cap_exceeded|schema_too_large|checksum|manifest|json_shape|constraint_unparsable|constraint_unsatisfiable|registry_host|overflow)$'
 
 mkdir -p "$WORK" && [ -z "$(ls -A "$WORK")" ] && mkdir "$WORK/stage" "$WORK/dl" || { echo "schema pass: the work directory is not empty"; exit 1; }
 [ ! -e "$OUT" ] && mkdir -p "$OUT" || { echo "schema pass: the output directory already exists"; exit 1; }
+[ -z "$HANDOFF" ] || [ ! -e "$HANDOFF" ] || { echo "schema pass: the handoff directory already exists"; exit 1; }
 : > "$WORK/reasons"
 note() { [[ "$1" =~ $reason_re ]] && echo "$1" >> "$WORK/reasons"; } # reason code only
 
@@ -152,7 +161,7 @@ for t in $SCHEMA_PROVIDERS; do
   if [ "$src" = "!registry_host" ]; then echo "$rev $dir !$loc registry_host" >> "$WORK/unres"; continue; fi
   ns="${src%%/*}" name="${src#*/}"
   [[ "$ns" =~ $name_re && "$name" =~ $name_re ]] || continue
-  echo "$rev|$dir|$ns/$name|${con// /}" >> "$WORK/ptok"
+  echo "$rev|$dir|$ns/$name|${con// /}|$loc" >> "$WORK/ptok"
 done
 : > "$WORK/types"
 for t in $SCHEMA_TYPES; do
@@ -163,6 +172,31 @@ for t in $SCHEMA_TYPES; do
   echo "$dir $ns/$name $kind $type" >> "$WORK/types"
 done
 sort -u -o "$WORK/types" "$WORK/types"
+
+# The handoff's inputs: the .tf files the gate read, as <commit>:<SHA-256>:<path>. Each
+# token must name the head or the merge base; another commit, a token outside the
+# pattern, or one path with two hashes in a revision means no handoff at all.
+hwhy=""
+if [ -n "$HANDOFF" ]; then
+  [[ "$SCHEMA_HEAD" =~ $sha_re && "$SCHEMA_MERGE_BASE" =~ $sha_re ]] || hwhy=no_commits
+  : > "$WORK/in-head"
+  : > "$WORK/in-base"
+  for t in $SCHEMA_INPUTS; do
+    [ -z "$hwhy" ] || break
+    [[ "$t" =~ $input_re ]] || { hwhy=inputs; break; }
+    c="${BASH_REMATCH[1]}" s="${BASH_REMATCH[2]}" f="${BASH_REMATCH[3]}"
+    case "/$f" in */./* | */../*) hwhy=inputs; break ;; esac
+    [ "$c" = "$SCHEMA_HEAD" ] || [ "$c" = "$SCHEMA_MERGE_BASE" ] || { hwhy=sha_mismatch; break; }
+    [ "$c" != "$SCHEMA_HEAD" ] || echo "$f $s" >> "$WORK/in-head"
+    [ "$c" != "$SCHEMA_MERGE_BASE" ] || echo "$f $s" >> "$WORK/in-base"
+  done
+  for r in head base; do
+    [ -z "$hwhy" ] || break
+    LC_ALL=C sort -u -o "$WORK/in-$r" "$WORK/in-$r"
+    [ -z "$(cut -d ' ' -f 1 "$WORK/in-$r" | uniq -d)" ] || hwhy=duplicate_path
+  done
+  mkdir "$WORK/hs"
+fi
 
 # 2. The directory and provider pairs: every head provider token and every provider a
 # head type is bound to. A provider with no head token is unconstrained.
@@ -208,20 +242,23 @@ while read -r -u 3 prov; do
     latest="$(tail -n 1 "$WORK/sat" | cut -d ' ' -f 2)" min=- floor=-
     has_lower "$WORK/hcl" && min="$(head -n 1 "$WORK/sat" | cut -d ' ' -f 2)"
     # The old floor, from the base: a base constraint that cannot be read or satisfied
-    # is recorded as old_floor_unresolved, never dropped.
-    freason=-
+    # is recorded as old_floor_unresolved, never dropped. The handoff's floor, hf, is the
+    # base floor even when it equals the minimum: null with no base entry, no_lower_bound
+    # with one that has no lower bound.
+    freason=- hf=null
     if awk -v d="$dir" '$1 == "base" && $2 == d && NF == 3 { f = 1 } END { exit !f }' "$WORK/unres"; then
       freason=constraint_unparsable
     elif awk -F'|' -v d="$dir" -v p="$prov" '$1 == "base" && $2 == d && $3 == p { f = 1 } END { exit !f }' "$WORK/ptok"; then
+      hf=no_lower_bound
       if ! clauses "$bc" > "$WORK/bcl"; then
         freason=constraint_unparsable
       elif has_lower "$WORK/bcl"; then
         f="$(satisfying "$WORK/bcl" "$cand" | head -n 1 | cut -d ' ' -f 2)"
-        if [ -z "$f" ]; then freason=constraint_unsatisfiable; elif [ "$f" != "$min" ]; then floor="$f"; fi
+        if [ -z "$f" ]; then freason=constraint_unsatisfiable; else hf="$f"; [ "$f" = "$min" ] || floor="$f"; fi
       fi
     fi
     [ "$freason" = - ] || note "$freason"
-    echo "$dir $prov ok $latest $min $floor $freason" >> "$WORK/resolved"
+    echo "$dir $prov ok $latest $min $floor $freason $hf" >> "$WORK/resolved"
   done 4< "$WORK/pairs"
 done 3< "$WORK/order"
 
@@ -284,6 +321,12 @@ while read -r -u 3 prov ver; do
   if [ -z "$bad" ]; then
     jq -e --arg k "registry.terraform.io/$prov" '(.format_version | type == "string" and test("^([0-9]+)\\.[0-9]+$") and (split(".")[0] == "1"))
       and (.provider_schemas | type == "object" and keys == [$k])' "$d/schema.json" > /dev/null 2>&1 || bad=json_shape
+  fi
+  # The handoff's block schemas for this version, every type; a malformed part leaves the
+  # version out of the handoff, and the fact sheets go on.
+  if [ -z "$bad" ] && [ -n "$HANDOFF" ] && [ -z "$hwhy" ]; then
+    jq -c --arg key "registry.terraform.io/$prov" --arg ver "$ver" -f "$HANDOFF_JQ" "$d/schema.json" > "$WORK/hs/${ns}_${name}_$ver.json" 2> /dev/null ||
+      { rm -f "$WORK/hs/${ns}_${name}_$ver.json"; echo "schema pass: no handoff schema for one provider version, json_shape"; }
   fi
   if [ -z "$bad" ]; then
     # The types this provider version is needed for, as JSON arguments; never program text.
@@ -385,6 +428,49 @@ done < "$WORK/pvok"
   | {format: 1, directories: .}' > "$OUT/versions.json" || exit 1
 (cd "$OUT" && find . -type f ! -path ./files.sha256 -printf '%P\n' | LC_ALL=C sort | while IFS= read -r f; do sha256sum -- "$f"; done) > "$WORK/files.sha256" &&
   mv "$WORK/files.sha256" "$OUT/files.sha256" || exit 1
+
+# 7. The schema handoff, as schema-pass.md gives it: per directory and local name the
+# versions or a reason, per provider version its block schemas, the commits and the .tf
+# inputs. Written under both caps, then moved into place whole; otherwise nothing.
+tree() { # "<path> <sha256>" lines sorted by path bytes -> {tree_hash, files}
+  jq -R -s -c --arg h "$(awk '{ print $2 "  " $1 }' "$1" | sha256sum | cut -d ' ' -f 1)" \
+    '{tree_hash: $h, files: (split("\n") | map(select(. != "") | split(" ") | {path: .[0], sha256: .[1]}))}' "$1"
+}
+if [ -n "$HANDOFF" ] && [ -z "$hwhy" ]; then
+  # One line per directory and local name: a reason, or - and the three versions.
+  while read -r dir prov st a b _ e hf; do
+    if [ "$st" != ok ]; then why="$a"
+    elif [ "$b" = - ]; then why=no_lower_bound
+    elif [ "$e" != - ]; then why="old_floor_$e"
+    elif [ "$hf" = no_lower_bound ]; then why=old_floor_no_lower_bound
+    else why=-; fi
+    locs="$(awk -F'|' -v d="$dir" -v p="$prov" '$1 == "head" && $2 == d && $3 == p { print $5 }' "$WORK/ptok" | sort -u)"
+    for l in ${locs:-${prov#*/}}; do
+      [[ "$l" =~ ^[a-z][a-z0-9_-]{0,63}$ ]] && echo "$dir $l $prov $why ${a:--} ${b:--} ${hf:-null}"
+    done
+  done < "$WORK/resolved" | LC_ALL=C sort -u > "$WORK/hdirs"
+  jq -R -s -c 'split("\n") | map(select(. != "") | split(" ")) | group_by(.[0])
+    | map({path: .[0][0], providers: map({local_name: .[1], source: ("registry.terraform.io/" + .[2])}
+      + if .[3] == "-" then {versions: {latest: .[4], declared_minimum: .[5], old_floor: (if .[6] == "null" then null else .[6] end)}}
+        else {unresolved_reason: .[3]} end)})' "$WORK/hdirs" > "$WORK/hdirs.json" || hwhy=json_shape
+  { tree "$WORK/in-head" && tree "$WORK/in-base"; } > "$WORK/hin.json" || hwhy=json_shape
+  find "$WORK/hs" -type f -name '*.json' -printf '%P\n' | LC_ALL=C sort | while IFS= read -r f; do cat -- "$WORK/hs/$f"; done > "$WORK/hps.json"
+  [ -n "$hwhy" ] || jq -n -c --arg h "$SCHEMA_HEAD" --arg m "$SCHEMA_MERGE_BASE" --argjson cz "$CAP_HANDOFF_GZ" --argjson cu "$CAP_HANDOFF" \
+    --slurpfile in "$WORK/hin.json" --slurpfile ds "$WORK/hdirs.json" --slurpfile ps "$WORK/hps.json" \
+    '{head_sha: $h, merge_base_sha: $m, inputs: {head: $in[0], merge_base: $in[1]},
+      caps: {compressed_bytes: $cz, uncompressed_bytes: $cu}, directories: $ds[0], provider_schemas: $ps}' > "$WORK/handoff.json" || hwhy=json_shape
+  [ -n "$hwhy" ] || [ "$(wc -c < "$WORK/handoff.json")" -le "$CAP_HANDOFF" ] || hwhy=cap_exceeded
+  [ -n "$hwhy" ] || gzip -n -c -- "$WORK/handoff.json" > "$WORK/handoff.json.gz" || hwhy=json_shape
+  [ -n "$hwhy" ] || [ "$(wc -c < "$WORK/handoff.json.gz")" -le "$CAP_HANDOFF_GZ" ] || hwhy=cap_exceeded
+  # A handoff that cannot be put in place is refused; it never fails the fact sheets.
+  if [ -z "$hwhy" ] && ! { mkdir -p "$HANDOFF" && mv "$WORK/handoff.json.gz" "$HANDOFF/schema-handoff.json.gz"; } 2> /dev/null; then
+    hwhy=write_failed
+    rm -rf "$HANDOFF" 2> /dev/null
+  fi
+  [ -n "$hwhy" ] || echo "schema pass: handoff written, $(jq length "$WORK/hdirs.json") directories, $(grep -c . "$WORK/hps.json") provider schemas"
+  rm -f "$WORK/handoff.json" "$WORK/handoff.json.gz"
+fi
+[ -z "$HANDOFF" ] || [ -z "$hwhy" ] || echo "schema pass: no handoff, $hwhy"
 
 echo "schema pass: $(wc -l < "$WORK/pvok") of $(wc -l < "$WORK/pv") provider versions read, $(grep -c . "$WORK/pagetypes") page types"
 sort "$WORK/reasons" | uniq -c | awk '{ print "schema pass reason: " $2 " " $1 }'

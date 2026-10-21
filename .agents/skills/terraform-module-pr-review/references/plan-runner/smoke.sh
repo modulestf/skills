@@ -170,7 +170,7 @@ check "pass: no deferred base line is left" test -z "$(grep -x 'base: deferred' 
 no_aws_reached() { # proxy log
   local log
   log="$(tr 'A-Z' 'a-z' < "$1")" || return 1
-  ! printf '%s\n' "$log" | grep -q 'established connection to host "[^"]*amazonaws' || return 1
+  ! printf '%s\n' "$log" | grep 'established connection to host "[^"]*amazonaws' > /dev/null || return 1
   [ "$(printf '%s\n' "$log" | sed -nE 's/.*request \(file descriptor [0-9]+\): [a-z]+ ([^ ]*amazonaws[^ ]*) http.*/\1/p' | sort)" = \
     "$(printf '%s\n' "$log" | sed -nE 's/.*proxying refused on filtered url "([^"]*amazonaws[^"]*)".*/\1/p' | sort)" ]
 }
